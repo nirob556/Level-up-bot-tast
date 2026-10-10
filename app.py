@@ -1,10 +1,9 @@
 # -*- coding: utf-8 -*-
 """
 ============================================================
-  FF Level Up Bot - Web Dashboard Edition
+  FF Level Up Bot - ULTIMATE EDITION
   Created by: NIROB
-  Version: 2.0.0
-  Description: Full-stack web dashboard for Free Fire bot
+  Version: 3.0.0
 ============================================================
 """
 
@@ -29,21 +28,25 @@ import struct
 import time
 import uuid
 import itertools
-import threading
-import queue
+import traceback
 from datetime import datetime
 from typing import Dict, List, Optional, Tuple, Any
 from collections import deque
 
 from fastapi import FastAPI, WebSocket, WebSocketDisconnect, Request
 from fastapi.responses import HTMLResponse, JSONResponse
-from fastapi.staticfiles import StaticFiles
 import uvicorn
 
 from google_play_scraper import app as play_scraper
 from Crypto.Cipher import AES
 from Crypto.Util.Padding import pad
-from protobuf_decoder.protobuf_decoder import Parser
+
+try:
+    from protobuf_decoder.protobuf_decoder import Parser
+    HAS_PROTO_DECODER = True
+except ImportError:
+    HAS_PROTO_DECODER = False
+    Parser = None
 
 try:
     from message_ids import MESSAGE_ID_TO_NAME
@@ -80,6 +83,8 @@ _ROUNDS = 16
 _FIELD_SIZES = {0: 1, 1: 2, 2: 2, 3: 1, 4: 2}
 _FIELD_NAMES = {0: "sendOption", 1: "cmd", 2: "orderId", 3: "flags", 4: "length"}
 
+FALLBACK_GETLOGIN_URL = "https://clientbp.ggpolarbear.com"
+
 CRC7_TABLE = bytes([
     0, 9, 18, 27, 36, 45, 54, 63, 72, 65, 90, 83, 108, 101, 126, 119,
     25, 16, 11, 2, 61, 52, 47, 38, 81, 88, 67, 74, 117, 124, 103, 110,
@@ -101,19 +106,22 @@ CRC7_TABLE = bytes([
 
 
 # ============================================================
-#  BROADCAST HUB - WebSocket log streaming
+#  BROADCAST HUB
 # ============================================================
 
 class BroadcastHub:
     def __init__(self):
         self.clients: List[WebSocket] = []
-        self.log_history = deque(maxlen=500)
+        self.log_history = deque(maxlen=1000)
         self.stats = {
             "accounts": {},
             "total_matches": 0,
             "active_matches": 0,
-            "uptime_start": time.time(),
-            "bot_status": "idle"
+            "uptime_start": 0,
+            "bot_status": "idle",
+            "session_matches": 0,
+            "success_rate": 0,
+            "total_logins": 0,
         }
         self._lock = asyncio.Lock()
 
@@ -121,7 +129,6 @@ class BroadcastHub:
         await ws.accept()
         async with self._lock:
             self.clients.append(ws)
-        # Send history on connect
         try:
             await ws.send_json({
                 "type": "history",
@@ -149,20 +156,10 @@ class BroadcastHub:
             if ws in self.clients:
                 self.clients.remove(ws)
 
-    async def log(self, level: str, message: str, account: str = ""):
-        entry = {
-            "time": datetime.now().strftime("%H:%M:%S"),
-            "level": level,
-            "message": message,
-            "account": account
-        }
-        await self.broadcast({"type": "log", "data": entry})
-
     async def update_stats(self):
         await self.broadcast({"type": "stats", "data": self.stats})
 
     def log_sync(self, level: str, message: str, account: str = ""):
-        """Thread-safe sync log from non-async context"""
         entry = {
             "time": datetime.now().strftime("%H:%M:%S"),
             "level": level,
@@ -206,7 +203,7 @@ def print_warning(msg):
 
 
 # ============================================================
-#  CORE BOT LOGIC (same as original)
+#  HTTP CLIENT
 # ============================================================
 
 client = httpx.AsyncClient(
@@ -228,6 +225,10 @@ headers = {
     'ReleaseVersion': 'OB55'
 }
 
+
+# ============================================================
+#  HELPERS
+# ============================================================
 
 def get_proto_field(d, key, default=None):
     if not d or not isinstance(d, dict):
@@ -532,10 +533,19 @@ async def parse_results(parsed_results):
 
 
 async def decode_protobuf(data):
-    parsed_results = Parser().parse(data)
-    parsed_results_dict = await parse_results(parsed_results)
-    return json.dumps(parsed_results_dict)
+    if not HAS_PROTO_DECODER:
+        return "{}"
+    try:
+        parsed_results = Parser().parse(data)
+        parsed_results_dict = await parse_results(parsed_results)
+        return json.dumps(parsed_results_dict)
+    except Exception:
+        return "{}"
 
+
+# ============================================================
+#  LOGIN FLOW
+# ============================================================
 
 async def build_majorlogin_payload(open_id, access_token, platform, client_version, device_info, verr=None):
     try:
@@ -616,20 +626,27 @@ async def build_majorlogin_payload(open_id, access_token, platform, client_versi
 
         full_payload = base_payload + extra
         return await aes_encrypt(full_payload, AES_KEY, AES_IV)
-    except Exception:
+    except Exception as e:
+        print_error(f"build_majorlogin_payload error: {e}")
         return None
 
 
 async def send_majorlogin(data, release_version, server_url):
     try:
+        if not server_url or not isinstance(server_url, str) or not server_url.startswith(("http://", "https://")):
+            print_error(f"Invalid server_url from version config: {server_url}")
+            return None
+
         url = f"{server_url}MajorLogin" if server_url.endswith('/') else f"{server_url}/MajorLogin"
         req_headers = headers.copy()
         req_headers["ReleaseVersion"] = str(release_version)
         response = await client.post(url, headers=req_headers, data=data)
         if response.status_code != 200:
+            print_error(f"MajorLogin HTTP {response.status_code}")
             return None
         response_content = response.content
         if len(response_content) < 40:
+            print_error(f"MajorLogin response too short: {len(response_content)}")
             return None
 
         res_proto = thunderFF_pb2.MajorLoginRes()
@@ -666,21 +683,40 @@ async def send_majorlogin(data, release_version, server_url):
             try: res_proto.iv_i = iv_val
             except Exception: pass
 
+        # ✅ FIX: URL safety fallback
+        try:
+            current_url = getattr(res_proto, 'url', None)
+            if not current_url or not isinstance(current_url, str) or not current_url.startswith(("http://", "https://")):
+                res_proto.url = FALLBACK_GETLOGIN_URL
+        except Exception:
+            res_proto.url = FALLBACK_GETLOGIN_URL
+
         return res_proto
     except Exception as e:
-        log(f"[-] send_majorlogin error: {e}")
+        print_error(f"send_majorlogin error: {e}")
         return None
 
 
 async def send_getlogin(data, base_url, token, release_version):
     try:
+        # ✅ FIX: base_url safety check
+        if not base_url or not isinstance(base_url, str) or not base_url.startswith(("http://", "https://")):
+            print_warning(f"Invalid GetLogin base_url ({base_url}) — using fallback: {FALLBACK_GETLOGIN_URL}")
+            base_url = FALLBACK_GETLOGIN_URL
+
         url = f"{base_url.rstrip('/')}/GetLoginData"
         req_headers = headers.copy()
         req_headers["ReleaseVersion"] = release_version
         req_headers['Authorization'] = f"Bearer {token}"
-        req_headers['Host'] = "clientbp.ppmainecoonghj.com"
+        try:
+            from urllib.parse import urlparse
+            req_headers['Host'] = urlparse(base_url).netloc or "clientbp.ggpolarbear.com"
+        except Exception:
+            req_headers['Host'] = "clientbp.ggpolarbear.com"
+
         response = await client.post(url, headers=req_headers, data=data)
         if response.status_code != 200:
+            print_error(f"GetLoginData HTTP {response.status_code}")
             return None
         response_content = response.content
 
@@ -762,9 +798,13 @@ async def send_getlogin(data, base_url, token, release_version):
 
         return res_proto, dict_res
     except Exception as e:
-        log(f"[-] send_getlogin error: {e}")
+        print_error(f"send_getlogin error: {e}")
         return None
 
+
+# ============================================================
+#  TCP PACKETS
+# ============================================================
 
 async def build_tcp_startup_packet(account_id, token, server_time, key, iv, region="ME", typ='OnLine'):
     uid_hex = f"{int(account_id):016x}"
@@ -809,6 +849,10 @@ async def start_game_battle_royale(region, client_version, writer, key, iv):
     await writer.drain()
     log(f"[BR] Match search sent ({packet_length} bytes) | Region: {reg}")
 
+
+# ============================================================
+#  TEA CBC
+# ============================================================
 
 async def tea_enc(v0, v1, k0, k1, k2, k3):
     s = 0
@@ -857,6 +901,30 @@ async def tea_cbc_encrypt(padded, key_bytes):
             out[i + j] = enc[j] ^ prev_intermediate[j]
         prev_cipher[:] = out[i:i + 8]
         prev_intermediate[:] = xored
+    return bytes(out)
+
+
+async def tea_cbc_decrypt(body, key_bytes):
+    k0, k1, k2, k3 = (struct.unpack_from("<I", key_bytes, o)[0] for o in (0, 4, 8, 12))
+    out = bytearray(len(body))
+    prev_intermediate = bytearray(8)
+    prev_cipher = bytearray(8)
+    xored = bytearray(8)
+    dec = bytearray(8)
+    for i in range(0, len(body), 8):
+        for j in range(8):
+            xored[j] = body[i + j] ^ prev_intermediate[j]
+        d0, d1 = await tea_dec(
+            struct.unpack_from("<I", xored, 0)[0],
+            struct.unpack_from("<I", xored, 4)[0],
+            k0, k1, k2, k3
+        )
+        struct.pack_into("<I", dec, 0, d0)
+        struct.pack_into("<I", dec, 4, d1)
+        for j in range(8):
+            out[i + j] = dec[j] ^ prev_cipher[j]
+        prev_cipher[:] = body[i:i + 8]
+        prev_intermediate[:] = dec
     return bytes(out)
 
 
@@ -957,30 +1025,6 @@ async def parse_layout(layout):
     if isinstance(layout, str):
         return [int(ch) for ch in layout.strip()]
     return list(layout)
-
-
-async def tea_cbc_decrypt(body, key_bytes):
-    k0, k1, k2, k3 = (struct.unpack_from("<I", key_bytes, o)[0] for o in (0, 4, 8, 12))
-    out = bytearray(len(body))
-    prev_intermediate = bytearray(8)
-    prev_cipher = bytearray(8)
-    xored = bytearray(8)
-    dec = bytearray(8)
-    for i in range(0, len(body), 8):
-        for j in range(8):
-            xored[j] = body[i + j] ^ prev_intermediate[j]
-        d0, d1 = await tea_dec(
-            struct.unpack_from("<I", xored, 0)[0],
-            struct.unpack_from("<I", xored, 4)[0],
-            k0, k1, k2, k3
-        )
-        struct.pack_into("<I", dec, 0, d0)
-        struct.pack_into("<I", dec, 4, d1)
-        for j in range(8):
-            out[i + j] = dec[j] ^ prev_cipher[j]
-        prev_cipher[:] = body[i:i + 8]
-        prev_intermediate[:] = dec
-    return bytes(out)
 
 
 async def build_hello_packet(text, key, layout):
@@ -1153,7 +1197,7 @@ async def decode_packet(packet, key, mask=None):
 
 
 # ============================================================
-#  BOT WORKER FUNCTIONS
+#  GAME PLAYER
 # ============================================================
 
 async def play_game(server_ip_port, thunder, sharma, udp_key, match_code,
@@ -1167,6 +1211,10 @@ async def play_game(server_ip_port, thunder, sharma, udp_key, match_code,
     completed_cleanly = False
 
     HUB.stats["active_matches"] += 1
+    try:
+        await HUB.update_stats()
+    except Exception:
+        pass
 
     try:
         ip, port = server_ip_port.split(":")
@@ -1186,9 +1234,9 @@ async def play_game(server_ip_port, thunder, sharma, udp_key, match_code,
         hello_packet = await build_hello_packet(f"{account_id}_2585", udp_key_bytes, match_code)
         try:
             await loop.sock_sendto(sock, bytes.fromhex(hello_packet), (resolved_ip, port))
-            log(f"[MATCH #{match_index}] [SEND-OK] HELLO size={len(bytes.fromhex(hello_packet))}B -> {(resolved_ip, port)}")
+            log(f"[MATCH #{match_index}] ✅ HELLO sent ({len(bytes.fromhex(hello_packet))}B) -> {resolved_ip}:{port}")
         except Exception as e:
-            log(f"[MATCH #{match_index}] [SEND-FAIL] HELLO: {e}")
+            log(f"[MATCH #{match_index}] ❌ HELLO failed: {e}")
 
         ack_state = "waiting_for_hello_reply"
         thunder_sent = False
@@ -1214,7 +1262,7 @@ async def play_game(server_ip_port, thunder, sharma, udp_key, match_code,
                 try:
                     thunder_b = bytes.fromhex(thunder)
                     await loop.sock_sendto(sock, thunder_b, (resolved_ip, port))
-                    log(f"[MATCH #{match_index}] [SEND-OK] THUNDER size={len(thunder_b)}B -> {(resolved_ip, port)}")
+                    log(f"[MATCH #{match_index}] ⚡ THUNDER sent ({len(thunder_b)}B)")
                     thunder_sent = True
 
                     await asyncio.sleep(0.3)
@@ -1224,19 +1272,19 @@ async def play_game(server_ip_port, thunder, sharma, udp_key, match_code,
                         0, 2, None, 1, b"\x01\x00", udp_key_bytes
                     )
                     await loop.sock_sendto(sock, prepare_ack, (resolved_ip, port))
-                    log(f"[MATCH #{match_index}] [SEND-OK] PREPARE_ACK size={len(prepare_ack)}B -> {(resolved_ip, port)}")
+                    log(f"[MATCH #{match_index}] 📤 PREPARE_ACK sent")
 
                     await asyncio.sleep(0.4)
 
                     sharma_b = bytes.fromhex(sharma)
                     await loop.sock_sendto(sock, sharma_b, (resolved_ip, port))
-                    log(f"[MATCH #{match_index}] [SEND-OK] SHARMA size={len(sharma_b)}B -> {(resolved_ip, port)}")
+                    log(f"[MATCH #{match_index}] 🌀 SHARMA sent ({len(sharma_b)}B)")
 
                     sharma_sent = True
                     ack_state = "thunder_sharma_sent"
-                    log(f"[MATCH #{match_index}] Startup delivered. Playing.")
+                    log(f"[MATCH #{match_index}] 🎮 Startup delivered. Playing.")
                 except Exception as e:
-                    log(f"[MATCH #{match_index}] [SEND-FAIL] Startup: {e}")
+                    log(f"[MATCH #{match_index}] ❌ Startup failed: {e}")
 
         while not local_closed:
             elapsed = time.time() - match_start_time
@@ -1256,10 +1304,9 @@ async def play_game(server_ip_port, thunder, sharma, udp_key, match_code,
                         cmd = frame['cmd']
 
                         if cmd in [103, 107]:
-                            log(f"[★] Match #{match_index} finished (cmd {cmd})")
+                            log(f"[MATCH #{match_index}] 🏁 Match finished (cmd {cmd})")
                             completed_cleanly = True
                             local_closed = True
-                            HUB.stats["total_matches"] += 1
                             continue
 
                         if cmd == 101:
@@ -1269,9 +1316,8 @@ async def play_game(server_ip_port, thunder, sharma, udp_key, match_code,
                                     0, 2, None, 1, b"\x01\x00", udp_key_bytes
                                 )
                                 await loop.sock_sendto(sock, ack_pkt, server_addr)
-                                log(f"[MATCH #{match_index}] [SEND-OK] ACK-101 size={len(ack_pkt)}B -> {server_addr}")
-                            except Exception as e:
-                                log(f"[MATCH #{match_index}] [SEND-FAIL] ACK-101: {e}")
+                            except Exception:
+                                pass
 
                         if ptype in ["ACK", "PING", "HELLO", "JOIN_MATCH"]:
                             if ptype == "HELLO" and ack_state == "waiting_for_hello_reply":
@@ -1281,9 +1327,8 @@ async def play_game(server_ip_port, thunder, sharma, udp_key, match_code,
                                 if reply:
                                     try:
                                         await loop.sock_sendto(sock, reply, server_addr)
-                                        log(f"[MATCH #{match_index}] [SEND-OK] HELLO-REPLY size={len(reply)}B -> {server_addr}")
-                                    except Exception as e:
-                                        log(f"[MATCH #{match_index}] [SEND-FAIL] HELLO-REPLY: {e}")
+                                    except Exception:
+                                        pass
                                 ack_state = "ack_sent_waiting"
                             elif ptype == "ACK":
                                 if ack_state == "waiting_for_hello_reply":
@@ -1291,9 +1336,8 @@ async def play_game(server_ip_port, thunder, sharma, udp_key, match_code,
                                     if reply:
                                         try:
                                             await loop.sock_sendto(sock, reply, server_addr)
-                                            log(f"[MATCH #{match_index}] [SEND-OK] ACK-REPLY size={len(reply)}B -> {server_addr}")
-                                        except Exception as e:
-                                            log(f"[MATCH #{match_index}] [SEND-FAIL] ACK-REPLY: {e}")
+                                        except Exception:
+                                            pass
                                     ack_state = "ready_to_send_thunder"
                                 elif ack_state == "ack_sent_waiting":
                                     ack_state = "ready_to_send_thunder"
@@ -1302,25 +1346,22 @@ async def play_game(server_ip_port, thunder, sharma, udp_key, match_code,
                                     if reply:
                                         try:
                                             await loop.sock_sendto(sock, reply, server_addr)
-                                            log(f"[MATCH #{match_index}] [SEND-OK] ACK-REPLY size={len(reply)}B -> {server_addr}")
-                                        except Exception as e:
-                                            log(f"[MATCH #{match_index}] [SEND-FAIL] ACK-REPLY: {e}")
+                                        except Exception:
+                                            pass
                             elif ptype == "PING":
                                 typ, reply = await reply_for(frame, udp_key_bytes, match_code)
                                 if reply:
                                     try:
                                         await loop.sock_sendto(sock, reply, server_addr)
-                                        log(f"[MATCH #{match_index}] [SEND-OK] PING-REPLY size={len(reply)}B -> {server_addr}")
-                                    except Exception as e:
-                                        log(f"[MATCH #{match_index}] [SEND-FAIL] PING-REPLY: {e}")
+                                    except Exception:
+                                        pass
                             elif ptype == "JOIN_MATCH" and not join_match_received:
                                 typ, reply = await reply_for(frame, udp_key_bytes, match_code)
                                 if reply:
                                     try:
                                         await loop.sock_sendto(sock, reply, server_addr)
-                                        log(f"[MATCH #{match_index}] [SEND-OK] JOIN-MATCH-REPLY size={len(reply)}B -> {server_addr}")
-                                    except Exception as e:
-                                        log(f"[MATCH #{match_index}] [SEND-FAIL] JOIN-MATCH-REPLY: {e}")
+                                    except Exception:
+                                        pass
                                     join_match_received = True
 
             except asyncio.TimeoutError:
@@ -1333,9 +1374,8 @@ async def play_game(server_ip_port, thunder, sharma, udp_key, match_code,
                                 f"{account_id}_2585", udp_key_bytes, match_code
                             )
                             await loop.sock_sendto(sock, bytes.fromhex(pkt), (resolved_ip, port))
-                            log(f"[MATCH #{match_index}] [SEND-OK] HELLO-RESEND size={len(bytes.fromhex(pkt))}B -> {(resolved_ip, port)}")
-                        except Exception as e:
-                            log(f"[MATCH #{match_index}] [SEND-FAIL] HELLO-RESEND: {e}")
+                        except Exception:
+                            pass
                         last_activity = time.time()
                     if (time.time() - match_start_time) > 25.0:
                         break
@@ -1351,6 +1391,10 @@ async def play_game(server_ip_port, thunder, sharma, udp_key, match_code,
 
             if ack_state == "ready_to_send_thunder" and not thunder_sent:
                 await send_thunder_sharma_inline()
+
+        if completed_cleanly:
+            HUB.stats["total_matches"] += 1
+            HUB.stats["session_matches"] += 1
 
         return f"match #{match_index} finished"
 
@@ -1474,8 +1518,6 @@ async def functional_br(addrs, starter_packet, account_region, client_version,
                     packet_length = len(data)
                     no_response_count = 0
 
-                    log(f"[DEBUG] UID {uid_str} recv len={packet_length} head={hex_data[:40]}")
-
                     if packet_length < 10:
                         continue
 
@@ -1498,7 +1540,7 @@ async def functional_br(addrs, starter_packet, account_region, client_version,
                     if not is_match_packet:
                         continue
 
-                    log(f"[+] Match found [BR] | UID: {uid_str} | size={packet_length}")
+                    log(f"[+] 🎯 Match found [BR] | UID: {uid_str} | size={packet_length}")
 
                     try:
                         res = json.loads(await decode_protobuf(payload_hex))
@@ -1524,8 +1566,6 @@ async def functional_br(addrs, starter_packet, account_region, client_version,
                             block_val = res['5']['data'].get('1', {}).get('data')
 
                         effective_acc_id = match_account_id or account_id or "ME_BOT"
-
-                        log(f"[DEBUG] UID {uid_str} parsed: token={'YES' if token else 'NO'} udp_key={'YES' if udp_key else 'NO'} match_code={'YES' if match_code else 'NO'} server={server_ip_port}")
 
                         if token and udp_key and match_code and server_ip_port:
                             acc_tok = current_account_data.get('access_token', '') if current_account_data else ""
@@ -1594,6 +1634,16 @@ async def functional_br(addrs, starter_packet, account_region, client_version,
                             new_level = 1
                             if current_account_data:
                                 new_level = max(1, int(current_account_data.get("level", 1) or 1))
+                                HUB.stats["accounts"][str(effective_acc_id)] = {
+                                    "nickname": current_account_data.get('nickname', 'Unknown'),
+                                    "level": new_level,
+                                    "exp": current_account_data.get('exp', 0),
+                                    "region": account_region,
+                                    "status": "running",
+                                    "matches": HUB.stats["accounts"].get(str(effective_acc_id), {}).get("matches", 0) + 1
+                                }
+                                await HUB.update_stats()
+
                             log(f"[*] UID {uid_str} | Lvl {new_level} | Next: BR")
 
                             if gateway_ping_task:
@@ -1603,7 +1653,6 @@ async def functional_br(addrs, starter_packet, account_region, client_version,
                             break
 
                         else:
-                            log(f"[DEBUG] UID {uid_str} not a valid match packet — ignoring")
                             continue
 
                     except Exception as e:
@@ -1743,12 +1792,13 @@ async def process_account_uid_pass(uid: str, password: str) -> Optional[Dict]:
         async with _LOGIN_SEMAPHORE:
             verconfig_res = await version_config()
             if verconfig_res is None:
+                print_error(f"Version config failed for {uid}")
                 return None
             release_version, client_version, server_url = verconfig_res
 
             tokengrant_response = await get_access_token(uid, password)
             if tokengrant_response is None:
-                log(f"[-] OAuth failed for UID {uid}")
+                print_error(f"OAuth failed for UID {uid}")
                 return None
             open_id, access_token, platform = tokengrant_response
 
@@ -1759,7 +1809,7 @@ async def process_account_uid_pass(uid: str, password: str) -> Optional[Dict]:
 
             majorlogin_response = await send_majorlogin(login_payload_data, release_version, server_url)
             if majorlogin_response is None:
-                log(f"[-] MajorLogin failed for {uid}")
+                print_error(f"MajorLogin failed for {uid}")
                 return None
 
             getlogin_result = await send_getlogin(
@@ -1769,14 +1819,14 @@ async def process_account_uid_pass(uid: str, password: str) -> Optional[Dict]:
                 release_version
             )
             if getlogin_result is None:
-                log(f"[-] GetLoginData failed for {uid}")
+                print_error(f"GetLoginData failed for {uid}")
                 return None
 
             res_proto, dict_res = getlogin_result
 
         acc_id = str(majorlogin_response.account_id)
         if acc_id == "0" or not acc_id or acc_id == "None":
-            log(f"[-] Invalid account_id (0) for UID {uid} — skipping this account")
+            print_error(f"Invalid account_id (0) for UID {uid}")
             return None
 
         level = int(get_proto_field(dict_res, 6, 1))
@@ -1803,7 +1853,8 @@ async def process_account_uid_pass(uid: str, password: str) -> Optional[Dict]:
         if not isinstance(iv_val, (bytes, bytearray)) or len(iv_val) < 16:
             iv_val = AES_IV
 
-        log(f"[+] Login OK | UID {acc_id} | {nickname} | Lvl {level} | Mode: BR")
+        HUB.stats["total_logins"] += 1
+        print_success(f"Login OK | UID {acc_id} | {nickname} | Lvl {level} | Mode: BR")
 
         account_data = {
             'account_id': majorlogin_response.account_id,
@@ -1830,7 +1881,8 @@ async def process_account_uid_pass(uid: str, password: str) -> Optional[Dict]:
         }
         return account_data
     except Exception as e:
-        log(f"[-] process_account_uid_pass error: {e}")
+        print_error(f"process_account_uid_pass error: {e}")
+        traceback.print_exc()
         return None
 
 
@@ -1855,7 +1907,7 @@ async def run_account_worker(account_data: Dict, label: str):
         await HUB.update_stats()
 
         if not func_addr or not isinstance(func_addr, str) or ":" not in func_addr:
-            print_warning(f"[!] No functional_addrs for {acc_id} — worker idle")
+            print_warning(f"No functional_addrs for {acc_id} — worker idle")
             HUB.stats["accounts"][acc_id]["status"] = "idle"
             await HUB.update_stats()
             while True:
@@ -1929,10 +1981,13 @@ async def run_account_worker(account_data: Dict, label: str):
         raise
     except Exception as e:
         print_error(f"run_account_worker error for {label}: {e}")
-        import traceback
         traceback.print_exc()
     finally:
         HUB.stats["accounts"].pop(acc_id, None)
+        try:
+            await HUB.update_stats()
+        except Exception:
+            pass
         for t in (informational_task, exp_task, functional_task):
             if t and not t.done():
                 t.cancel()
@@ -1951,7 +2006,7 @@ async def account_loop_guest(uid: str, password: str):
             log(f"[*] Starting login for UID: {uid_str}")
             account_data = await process_account_uid_pass(uid_str, password)
             if not account_data:
-                log(f"[-] Login failed for {uid_str}. Retry in 15s...")
+                print_warning(f"Login failed for {uid_str}. Retry in 15s...")
                 await asyncio.sleep(15)
                 continue
             await run_account_worker(account_data, uid_str)
@@ -1961,17 +2016,17 @@ async def account_loop_guest(uid: str, password: str):
             log(f"[!] Worker stopped for {uid_str}")
             break
         except Exception as e:
-            log(f"[-] Error for UID {uid_str}: {e}. Retry in 10s...")
+            print_error(f"Error for UID {uid_str}: {e}")
             await asyncio.sleep(10)
 
 
 # ============================================================
-#  FASTAPI WEB SERVER + DASHBOARD
+#  FASTAPI APP
 # ============================================================
 
-app = FastAPI(title="FF Level Up Bot", version="2.0.0")
+app = FastAPI(title="FF Level Up Bot", version="3.0.0")
 
-# Global bot manager
+
 class BotManager:
     def __init__(self):
         self.tasks: List[asyncio.Task] = []
@@ -1985,10 +2040,13 @@ class BotManager:
         self.running = True
         HUB.stats["bot_status"] = "running"
         HUB.stats["uptime_start"] = time.time()
-        await HUB.log("success", f"🚀 Bot started with {len(accounts)} account(s)")
+        HUB.stats["session_matches"] = 0
+        HUB.stats["total_matches"] = 0
+        await HUB.log_sync("success", f"🚀 Bot started with {len(accounts)} account(s)")
         for acc in accounts:
             task = asyncio.create_task(account_loop_guest(acc['uid'], acc['password']))
             self.tasks.append(task)
+        await HUB.update_stats()
         return True, "Bot started"
 
     async def stop(self):
@@ -2005,7 +2063,8 @@ class BotManager:
         self.running = False
         HUB.stats["bot_status"] = "stopped"
         HUB.stats["accounts"].clear()
-        await HUB.log("warning", "🛑 Bot stopped")
+        HUB.stats["active_matches"] = 0
+        await HUB.log_sync("warning", "🛑 Bot stopped")
         await HUB.update_stats()
         return True, "Bot stopped"
 
@@ -2057,7 +2116,6 @@ async def api_start(request: Request):
         accounts = body.get("accounts", [])
         if not accounts:
             return JSONResponse({"ok": False, "message": "No accounts provided"}, status_code=400)
-        # Validate accounts
         valid = []
         for acc in accounts:
             if acc.get("uid") and acc.get("password"):
@@ -2076,1055 +2134,1227 @@ async def api_stop():
     return JSONResponse({"ok": ok, "message": msg})
 
 
+@app.post("/api/test-connection")
+async def api_test():
+    try:
+        result = await version_config()
+        if result:
+            return JSONResponse({
+                "ok": True,
+                "message": "Server reachable",
+                "version": result[0],
+                "remote": result[1]
+            })
+        return JSONResponse({"ok": False, "message": "Cannot reach server"})
+    except Exception as e:
+        return JSONResponse({"ok": False, "message": str(e)})
+
+
 @app.get("/", response_class=HTMLResponse)
 async def dashboard():
     return DASHBOARD_HTML
 
 
 # ============================================================
-#  DASHBOARD HTML (Single Page)
+#  ULTIMATE DASHBOARD HTML
 # ============================================================
 
-DASHBOARD_HTML = r"""
-<!DOCTYPE html>
+DASHBOARD_HTML = r"""<!DOCTYPE html>
 <html lang="en">
 <head>
 <meta charset="UTF-8">
-<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<meta name="viewport" content="width=device-width, initial-scale=1.0, maximum-scale=1.0, user-scalable=no">
+<meta name="theme-color" content="#0a0e1a">
 <title>FF Level Up Bot — by NIROB</title>
 <link rel="preconnect" href="https://fonts.googleapis.com">
 <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
-<link href="https://fonts.googleapis.com/css2?family=Inter:wght@400;500;600;700;800;900&family=JetBrains+Mono:wght@400;500;600&display=swap" rel="stylesheet">
+<link href="https://fonts.googleapis.com/css2?family=Inter:wght@400;500;600;700;800;900&family=JetBrains+Mono:wght@400;500;600;700&display=swap" rel="stylesheet">
 <style>
-* { margin: 0; padding: 0; box-sizing: border-box; }
-
-:root {
-    --bg-0: #0a0e1a;
-    --bg-1: #0f1420;
-    --bg-2: #151b2b;
-    --bg-3: #1c2438;
-    --border: #232c44;
-    --text-0: #e8ecf7;
-    --text-1: #9aa4be;
-    --text-2: #5e6885;
-    --accent: #ff6b35;
-    --accent-2: #ff8a5c;
-    --accent-glow: rgba(255, 107, 53, 0.4);
-    --success: #10d77e;
-    --warning: #ffb800;
-    --error: #ff3b5c;
-    --info: #4d9dff;
-    --gradient: linear-gradient(135deg, #ff6b35 0%, #ff3b5c 100%);
-}
-
-body {
-    font-family: 'Inter', -apple-system, BlinkMacSystemFont, sans-serif;
-    background: var(--bg-0);
-    color: var(--text-0);
-    min-height: 100vh;
-    overflow-x: hidden;
-    background-image:
-        radial-gradient(ellipse 80% 50% at 50% -20%, rgba(255, 107, 53, 0.15), transparent),
-        radial-gradient(ellipse 60% 50% at 80% 100%, rgba(77, 157, 255, 0.08), transparent);
-    background-attachment: fixed;
-}
-
-/* Header */
-.header {
-    padding: 20px 32px;
-    border-bottom: 1px solid var(--border);
-    background: rgba(15, 20, 32, 0.85);
-    backdrop-filter: blur(20px);
-    -webkit-backdrop-filter: blur(20px);
-    position: sticky;
-    top: 0;
-    z-index: 100;
-    display: flex;
-    align-items: center;
-    justify-content: space-between;
-    flex-wrap: wrap;
-    gap: 16px;
-}
-
-.brand {
-    display: flex;
-    align-items: center;
-    gap: 14px;
-}
-
-.logo {
-    width: 46px;
-    height: 46px;
-    border-radius: 12px;
-    background: var(--gradient);
-    display: flex;
-    align-items: center;
-    justify-content: center;
-    font-size: 22px;
-    box-shadow: 0 8px 24px var(--accent-glow);
-    position: relative;
-    overflow: hidden;
-}
-
-.logo::after {
-    content: '';
-    position: absolute;
-    inset: 0;
-    background: linear-gradient(45deg, transparent 30%, rgba(255,255,255,0.3) 50%, transparent 70%);
-    animation: shine 3s infinite;
-}
-
-@keyframes shine {
-    0% { transform: translateX(-100%); }
-    100% { transform: translateX(100%); }
-}
-
-.brand-text h1 {
-    font-size: 20px;
-    font-weight: 800;
-    letter-spacing: -0.5px;
-    background: linear-gradient(135deg, #fff, #b8c0d8);
-    -webkit-background-clip: text;
-    -webkit-text-fill-color: transparent;
-    background-clip: text;
-}
-
-.brand-text p {
-    font-size: 11px;
-    color: var(--accent);
-    font-weight: 600;
-    letter-spacing: 1.5px;
-    text-transform: uppercase;
-}
-
-.header-actions {
-    display: flex;
-    align-items: center;
-    gap: 12px;
-}
-
-.status-pill {
-    display: flex;
-    align-items: center;
-    gap: 8px;
-    padding: 8px 16px;
-    border-radius: 100px;
-    background: var(--bg-2);
-    border: 1px solid var(--border);
-    font-size: 13px;
-    font-weight: 600;
+*{margin:0;padding:0;box-sizing:border-box;-webkit-tap-highlight-color:transparent}
+
+:root{
+  --bg-0:#070a13;
+  --bg-1:#0d1220;
+  --bg-2:#141a2e;
+  --bg-3:#1c2440;
+  --bg-4:#242e50;
+  --border:#232c48;
+  --border-2:#2f3a5c;
+  --text-0:#eef2fb;
+  --text-1:#9aa6c4;
+  --text-2:#5e6a8a;
+  --accent:#ff6b35;
+  --accent-2:#ff8a5c;
+  --accent-3:#ff3b5c;
+  --accent-glow:rgba(255,107,53,.45);
+  --success:#10d77e;
+  --warning:#ffb800;
+  --error:#ff3b5c;
+  --info:#4d9dff;
+  --purple:#a855f7;
+  --gradient:linear-gradient(135deg,#ff6b35 0%,#ff3b5c 100%);
+  --gradient-2:linear-gradient(135deg,#4d9dff 0%,#a855f7 100%);
+  --gradient-success:linear-gradient(135deg,#10d77e 0%,#06b6d4 100%);
+}
+
+html,body{height:100%}
+
+body{
+  font-family:'Inter',-apple-system,BlinkMacSystemFont,'Segoe UI',sans-serif;
+  background:var(--bg-0);
+  color:var(--text-0);
+  min-height:100vh;
+  overflow-x:hidden;
+  background-image:
+    radial-gradient(ellipse 80% 50% at 50% -20%,rgba(255,107,53,.18),transparent),
+    radial-gradient(ellipse 60% 50% at 80% 100%,rgba(77,157,255,.10),transparent),
+    radial-gradient(ellipse 60% 50% at 0% 50%,rgba(168,85,247,.08),transparent);
+  background-attachment:fixed;
+  font-size:14px;
+  line-height:1.5;
+}
+
+/* Animated background particles */
+body::before{
+  content:'';
+  position:fixed;
+  inset:0;
+  background-image:
+    radial-gradient(2px 2px at 20% 30%,rgba(255,107,53,.4),transparent),
+    radial-gradient(2px 2px at 60% 70%,rgba(77,157,255,.3),transparent),
+    radial-gradient(2px 2px at 80% 20%,rgba(168,85,247,.3),transparent);
+  background-size:200px 200px,300px 300px,250px 250px;
+  animation:float 20s linear infinite;
+  pointer-events:none;
+  opacity:.5;
+  z-index:0;
+}
+
+@keyframes float{
+  0%{transform:translateY(0)}
+  100%{transform:translateY(-200px)}
+}
+
+/* ============ HEADER ============ */
+.header{
+  padding:16px 20px;
+  border-bottom:1px solid var(--border);
+  background:rgba(13,18,32,.85);
+  backdrop-filter:blur(24px);
+  -webkit-backdrop-filter:blur(24px);
+  position:sticky;
+  top:0;
+  z-index:100;
+  display:flex;
+  align-items:center;
+  justify-content:space-between;
+  gap:12px;
+  flex-wrap:wrap;
+}
+
+.brand{display:flex;align-items:center;gap:12px;min-width:0}
+
+.logo{
+  width:48px;height:48px;border-radius:14px;
+  background:var(--gradient);
+  display:flex;align-items:center;justify-content:center;
+  font-size:24px;
+  box-shadow:0 8px 28px var(--accent-glow),inset 0 2px 4px rgba(255,255,255,.2);
+  position:relative;overflow:hidden;
+  flex-shrink:0;
+  animation:logoPulse 3s ease-in-out infinite;
+}
+
+@keyframes logoPulse{
+  0%,100%{box-shadow:0 8px 28px var(--accent-glow),inset 0 2px 4px rgba(255,255,255,.2)}
+  50%{box-shadow:0 12px 40px var(--accent-glow),inset 0 2px 4px rgba(255,255,255,.2)}
+}
+
+.logo::after{
+  content:'';
+  position:absolute;inset:0;
+  background:linear-gradient(45deg,transparent 30%,rgba(255,255,255,.35) 50%,transparent 70%);
+  animation:shine 3s infinite;
 }
 
-.status-dot {
-    width: 8px;
-    height: 8px;
-    border-radius: 50%;
-    background: var(--text-2);
-    position: relative;
+@keyframes shine{
+  0%{transform:translateX(-100%)}
+  100%{transform:translateX(100%)}
 }
 
-.status-dot.running {
-    background: var(--success);
-    box-shadow: 0 0 12px var(--success);
-    animation: pulse 2s infinite;
+.brand-text{min-width:0}
+.brand-text h1{
+  font-size:17px;font-weight:800;letter-spacing:-.3px;
+  background:linear-gradient(135deg,#fff,#b8c0d8);
+  -webkit-background-clip:text;-webkit-text-fill-color:transparent;
+  background-clip:text;
+  white-space:nowrap;overflow:hidden;text-overflow:ellipsis;
 }
+.brand-text p{
+  font-size:10px;color:var(--accent);font-weight:700;
+  letter-spacing:1.5px;text-transform:uppercase;
+  white-space:nowrap;
+}
+
+.header-actions{display:flex;align-items:center;gap:8px;flex-wrap:wrap}
+
+.status-pill{
+  display:flex;align-items:center;gap:8px;
+  padding:8px 14px;border-radius:100px;
+  background:var(--bg-2);border:1px solid var(--border);
+  font-size:12px;font-weight:700;
+  transition:all .3s;
+}
+
+.status-pill.running{border-color:rgba(16,215,126,.4);background:rgba(16,215,126,.08)}
+.status-pill.stopped{border-color:rgba(255,59,92,.4);background:rgba(255,59,92,.08)}
+
+.status-dot{
+  width:8px;height:8px;border-radius:50%;
+  background:var(--text-2);position:relative;
+}
+
+.status-dot.running{
+  background:var(--success);
+  box-shadow:0 0 12px var(--success),0 0 24px var(--success);
+  animation:pulse 1.5s infinite;
+}
+
+.status-dot.stopped{background:var(--error);box-shadow:0 0 12px var(--error)}
+.status-dot.idle{background:var(--warning);box-shadow:0 0 12px var(--warning)}
+
+@keyframes pulse{0%,100%{opacity:1}50%{opacity:.4}}
+
+/* ============ CONTAINER ============ */
+.container{max-width:1600px;margin:0 auto;padding:20px;position:relative;z-index:1}
+
+/* ============ STATS ============ */
+.stats-grid{
+  display:grid;
+  grid-template-columns:repeat(auto-fit,minmax(160px,1fr));
+  gap:12px;margin-bottom:20px;
+}
+
+.stat-card{
+  background:linear-gradient(145deg,var(--bg-1),var(--bg-2));
+  border:1px solid var(--border);
+  border-radius:16px;
+  padding:16px;
+  position:relative;overflow:hidden;
+  transition:transform .3s,border-color .3s,box-shadow .3s;
+}
+
+.stat-card:hover{
+  transform:translateY(-3px);
+  border-color:var(--accent);
+  box-shadow:0 12px 32px rgba(255,107,53,.15);
+}
+
+.stat-card::before{
+  content:'';position:absolute;
+  top:0;left:0;right:0;height:3px;
+  background:var(--gradient);opacity:.8;
+}
+
+.stat-card.blue::before{background:var(--gradient-2)}
+.stat-card.green::before{background:var(--gradient-success)}
+
+.stat-icon{
+  font-size:20px;margin-bottom:8px;
+  display:inline-block;
+}
+
+.stat-label{
+  font-size:10px;text-transform:uppercase;letter-spacing:1.5px;
+  color:var(--text-2);font-weight:800;margin-bottom:8px;
+}
+
+.stat-value{
+  font-size:28px;font-weight:900;letter-spacing:-1px;
+  background:linear-gradient(135deg,#fff,#9aa6c4);
+  -webkit-background-clip:text;-webkit-text-fill-color:transparent;
+  background-clip:text;
+  font-variant-numeric:tabular-nums;
+  line-height:1;
+}
+
+.stat-value.accent{
+  background:var(--gradient);
+  -webkit-background-clip:text;-webkit-text-fill-color:transparent;
+  background-clip:text;
+}
+
+.stat-value.blue{
+  background:var(--gradient-2);
+  -webkit-background-clip:text;-webkit-text-fill-color:transparent;
+  background-clip:text;
+}
+
+.stat-value.green{
+  background:var(--gradient-success);
+  -webkit-background-clip:text;-webkit-text-fill-color:transparent;
+  background-clip:text;
+}
+
+.stat-sub{font-size:11px;color:var(--text-2);margin-top:6px;font-weight:500}
+
+/* ============ MAIN GRID ============ */
+.main-grid{
+  display:grid;
+  grid-template-columns:400px 1fr;
+  gap:16px;
+  align-items:start;
+}
+
+@media(max-width:1100px){.main-grid{grid-template-columns:1fr}}
+
+/* ============ PANEL ============ */
+.panel{
+  background:linear-gradient(145deg,var(--bg-1),rgba(20,26,46,.6));
+  border:1px solid var(--border);
+  border-radius:18px;
+  overflow:hidden;
+  box-shadow:0 4px 24px rgba(0,0,0,.3);
+}
+
+.panel-header{
+  padding:16px 20px;
+  border-bottom:1px solid var(--border);
+  display:flex;align-items:center;justify-content:space-between;
+  background:linear-gradient(180deg,var(--bg-2),rgba(20,26,46,.3));
+}
+
+.panel-title{
+  font-size:13px;font-weight:800;
+  letter-spacing:.5px;
+  display:flex;align-items:center;gap:8px;
+  text-transform:uppercase;
+}
+
+.panel-title .icon{color:var(--accent);font-size:16px}
 
-.status-dot.stopped { background: var(--error); }
-.status-dot.idle { background: var(--warning); }
+.panel-body{padding:20px}
+
+/* ============ FORM ============ */
+.form-group{margin-bottom:14px}
+
+.form-label{
+  display:block;font-size:10px;font-weight:800;
+  text-transform:uppercase;letter-spacing:1.2px;
+  color:var(--text-2);margin-bottom:6px;
+}
 
-@keyframes pulse {
-    0%, 100% { opacity: 1; }
-    50% { opacity: 0.5; }
+.form-input{
+  width:100%;padding:12px 14px;
+  background:var(--bg-0);
+  border:1px solid var(--border);
+  border-radius:10px;
+  color:var(--text-0);
+  font-family:'JetBrains Mono',monospace;
+  font-size:13px;outline:none;
+  transition:border-color .2s,box-shadow .2s;
 }
 
-/* Container */
-.container {
-    max-width: 1600px;
-    margin: 0 auto;
-    padding: 28px 32px 60px;
+.form-input:focus{
+  border-color:var(--accent);
+  box-shadow:0 0 0 3px var(--accent-glow);
 }
 
-/* Stats Grid */
-.stats-grid {
-    display: grid;
-    grid-template-columns: repeat(auto-fit, minmax(220px, 1fr));
-    gap: 16px;
-    margin-bottom: 28px;
+.form-input::placeholder{color:var(--text-2)}
+
+/* ============ ACCOUNT LIST ============ */
+.accounts-list{
+  max-height:220px;overflow-y:auto;
+  margin-bottom:12px;padding-right:4px;
 }
+
+.accounts-list::-webkit-scrollbar{width:5px}
+.accounts-list::-webkit-scrollbar-track{background:var(--bg-0);border-radius:3px}
+.accounts-list::-webkit-scrollbar-thumb{background:var(--border);border-radius:3px}
+.accounts-list::-webkit-scrollbar-thumb:hover{background:var(--accent)}
 
-.stat-card {
-    background: var(--bg-1);
-    border: 1px solid var(--border);
-    border-radius: 16px;
-    padding: 20px;
-    position: relative;
-    overflow: hidden;
-    transition: transform 0.3s, border-color 0.3s;
+.account-item{
+  display:flex;align-items:center;gap:10px;
+  padding:10px 12px;
+  background:var(--bg-2);
+  border:1px solid var(--border);
+  border-radius:10px;
+  margin-bottom:6px;
+  transition:all .2s;
+  animation:slideIn .3s ease-out;
 }
 
-.stat-card:hover {
-    transform: translateY(-3px);
-    border-color: var(--accent);
+.account-item:hover{
+  border-color:var(--accent);
+  background:var(--bg-3);
+  transform:translateX(2px);
 }
 
-.stat-card::before {
-    content: '';
-    position: absolute;
-    top: 0; left: 0; right: 0;
-    height: 2px;
-    background: var(--gradient);
-    opacity: 0.7;
+@keyframes slideIn{from{opacity:0;transform:translateX(-8px)}to{opacity:1;transform:translateX(0)}}
+
+.account-avatar{
+  width:34px;height:34px;border-radius:10px;
+  background:var(--gradient);
+  display:flex;align-items:center;justify-content:center;
+  font-size:14px;font-weight:800;color:#fff;
+  flex-shrink:0;
 }
 
-.stat-label {
-    font-size: 11px;
-    text-transform: uppercase;
-    letter-spacing: 1.5px;
-    color: var(--text-2);
-    font-weight: 700;
-    margin-bottom: 10px;
-    display: flex;
-    align-items: center;
-    gap: 6px;
+.account-info{flex:1;min-width:0}
+.account-uid{
+  color:var(--text-0);font-weight:700;
+  font-family:'JetBrains Mono',monospace;
+  font-size:12px;
+  white-space:nowrap;overflow:hidden;text-overflow:ellipsis;
 }
+.account-pass{
+  color:var(--text-2);font-size:10px;
+  font-family:'JetBrains Mono',monospace;
+  white-space:nowrap;overflow:hidden;text-overflow:ellipsis;
+}
 
-.stat-value {
-    font-size: 32px;
-    font-weight: 800;
-    letter-spacing: -1px;
-    background: linear-gradient(135deg, #fff, #9aa4be);
-    -webkit-background-clip: text;
-    -webkit-text-fill-color: transparent;
-    background-clip: text;
-    font-variant-numeric: tabular-nums;
+.btn-remove{
+  background:transparent;border:1px solid var(--border);
+  color:var(--error);
+  width:28px;height:28px;border-radius:8px;
+  cursor:pointer;font-size:14px;
+  display:flex;align-items:center;justify-content:center;
+  transition:all .2s;flex-shrink:0;
 }
 
-.stat-value.accent {
-    background: var(--gradient);
-    -webkit-background-clip: text;
-    -webkit-text-fill-color: transparent;
-    background-clip: text;
+.btn-remove:hover{
+  background:var(--error);color:#fff;
+  border-color:var(--error);
+  transform:scale(1.1);
 }
 
-.stat-sub {
-    font-size: 12px;
-    color: var(--text-2);
-    margin-top: 6px;
+/* ============ BUTTONS ============ */
+.btn{
+  width:100%;padding:13px 20px;border:none;
+  border-radius:11px;
+  font-family:'Inter',sans-serif;
+  font-size:12px;font-weight:800;
+  letter-spacing:1px;cursor:pointer;
+  transition:all .2s;
+  display:flex;align-items:center;justify-content:center;gap:8px;
+  text-transform:uppercase;
+  position:relative;overflow:hidden;
 }
 
-/* Main Grid */
-.main-grid {
-    display: grid;
-    grid-template-columns: 420px 1fr;
-    gap: 20px;
-    align-items: start;
+.btn::before{
+  content:'';position:absolute;inset:0;
+  background:linear-gradient(90deg,transparent,rgba(255,255,255,.15),transparent);
+  transform:translateX(-100%);
+  transition:transform .5s;
 }
+
+.btn:hover::before{transform:translateX(100%)}
 
-@media (max-width: 1100px) {
-    .main-grid { grid-template-columns: 1fr; }
+.btn:disabled{opacity:.5;cursor:not-allowed}
+.btn:disabled::before{display:none}
+
+.btn-primary{
+  background:var(--gradient);color:#fff;
+  box-shadow:0 6px 20px var(--accent-glow);
+}
+.btn-primary:not(:disabled):hover{
+  transform:translateY(-2px);
+  box-shadow:0 12px 32px var(--accent-glow);
 }
 
-/* Panel */
-.panel {
-    background: var(--bg-1);
-    border: 1px solid var(--border);
-    border-radius: 16px;
-    overflow: hidden;
+.btn-secondary{
+  background:var(--bg-2);color:var(--text-0);
+  border:1px solid var(--border);
 }
+.btn-secondary:not(:disabled):hover{
+  background:var(--bg-3);border-color:var(--accent);
+}
 
-.panel-header {
-    padding: 18px 22px;
-    border-bottom: 1px solid var(--border);
-    display: flex;
-    align-items: center;
-    justify-content: space-between;
-    background: var(--bg-2);
+.btn-danger{
+  background:linear-gradient(135deg,#ff3b5c,#c9184a);
+  color:#fff;
+  box-shadow:0 6px 20px rgba(255,59,92,.4);
 }
+.btn-danger:not(:disabled):hover{
+  transform:translateY(-2px);
+  box-shadow:0 12px 32px rgba(255,59,92,.5);
+}
 
-.panel-title {
-    font-size: 14px;
-    font-weight: 700;
-    letter-spacing: 0.5px;
-    display: flex;
-    align-items: center;
-    gap: 8px;
+.btn-success{
+  background:var(--gradient-success);color:#fff;
+  box-shadow:0 6px 20px rgba(16,215,126,.4);
 }
+
+.btn-row{display:flex;gap:8px;margin-top:8px}
 
-.panel-title .icon {
-    color: var(--accent);
-    font-size: 16px;
-}
+/* ============ LOGS ============ */
+.tabs{
+  display:flex;gap:4px;padding:4px;
+  background:var(--bg-2);border-radius:12px;
+  margin-bottom:14px;
+}
 
-.panel-body {
-    padding: 22px;
+.tab{
+  flex:1;padding:10px 14px;
+  border-radius:9px;
+  font-size:11px;font-weight:800;
+  letter-spacing:.5px;text-align:center;
+  cursor:pointer;color:var(--text-1);
+  transition:all .2s;text-transform:uppercase;
+  position:relative;
 }
 
-/* Form */
-.form-group {
-    margin-bottom: 16px;
-}
-
-.form-label {
-    display: block;
-    font-size: 11px;
-    font-weight: 700;
-    text-transform: uppercase;
-    letter-spacing: 1.2px;
-    color: var(--text-2);
-    margin-bottom: 8px;
-}
-
-.form-input {
-    width: 100%;
-    padding: 12px 14px;
-    background: var(--bg-0);
-    border: 1px solid var(--border);
-    border-radius: 10px;
-    color: var(--text-0);
-    font-family: 'JetBrains Mono', monospace;
-    font-size: 13px;
-    outline: none;
-    transition: border-color 0.2s, box-shadow 0.2s;
-}
-
-.form-input:focus {
-    border-color: var(--accent);
-    box-shadow: 0 0 0 3px var(--accent-glow);
+.tab .badge{
+  display:inline-block;
+  background:var(--accent);
+  color:#fff;
+  font-size:9px;
+  padding:1px 6px;
+  border-radius:100px;
+  margin-left:6px;
+  font-weight:900;
 }
 
-.form-input::placeholder { color: var(--text-2); }
-
-/* Account List */
-.accounts-list {
-    max-height: 240px;
-    overflow-y: auto;
-    margin-bottom: 14px;
-    padding-right: 4px;
+.tab.active{
+  background:var(--gradient);
+  color:#fff;
+  box-shadow:0 4px 12px var(--accent-glow);
 }
+
+.tab:not(.active):hover{color:var(--text-0);background:var(--bg-3)}
 
-.accounts-list::-webkit-scrollbar { width: 6px; }
-.accounts-list::-webkit-scrollbar-track { background: var(--bg-0); border-radius: 3px; }
-.accounts-list::-webkit-scrollbar-thumb { background: var(--border); border-radius: 3px; }
-.accounts-list::-webkit-scrollbar-thumb:hover { background: var(--accent); }
+.tab-content{display:none}
+.tab-content.active{display:block}
 
-.account-item {
-    display: flex;
-    align-items: center;
-    justify-content: space-between;
-    padding: 10px 14px;
-    background: var(--bg-2);
-    border: 1px solid var(--border);
-    border-radius: 10px;
-    margin-bottom: 8px;
-    font-family: 'JetBrains Mono', monospace;
-    font-size: 12px;
-    transition: border-color 0.2s;
+.logs-container{
+  background:var(--bg-0);
+  border-radius:12px;
+  height:560px;overflow-y:auto;
+  padding:14px;
+  font-family:'JetBrains Mono',monospace;
+  font-size:12px;line-height:1.7;
+  border:1px solid var(--border);
 }
 
-.account-item:hover { border-color: var(--accent); }
+.logs-container::-webkit-scrollbar{width:8px}
+.logs-container::-webkit-scrollbar-track{background:var(--bg-0);border-radius:4px}
+.logs-container::-webkit-scrollbar-thumb{background:var(--border);border-radius:4px}
+.logs-container::-webkit-scrollbar-thumb:hover{background:var(--accent)}
+
+.log-entry{
+  display:flex;gap:8px;
+  padding:3px 0;
+  border-bottom:1px solid rgba(35,44,72,.3);
+  animation:slideIn .15s ease-out;
+  word-break:break-word;
+}
 
-.account-info {
-    display: flex;
-    flex-direction: column;
-    gap: 3px;
-    overflow: hidden;
+.log-time{color:var(--text-2);flex-shrink:0;font-size:11px}
+.log-level{
+  font-weight:800;flex-shrink:0;width:66px;
+  text-transform:uppercase;font-size:10px;
+  padding-top:1px;
 }
+.log-msg{color:var(--text-0);flex:1;min-width:0}
 
-.account-uid { color: var(--text-0); font-weight: 600; }
-.account-pass { color: var(--text-2); font-size: 11px; }
+.log-entry.info .log-level{color:var(--info)}
+.log-entry.success .log-level{color:var(--success)}
+.log-entry.warning .log-level{color:var(--warning)}
+.log-entry.error .log-level{color:var(--error)}
 
-.btn-remove {
-    background: transparent;
-    border: 1px solid var(--border);
-    color: var(--error);
-    width: 26px;
-    height: 26px;
-    border-radius: 6px;
-    cursor: pointer;
-    font-size: 14px;
-    display: flex;
-    align-items: center;
-    justify-content: center;
-    transition: all 0.2s;
-    flex-shrink: 0;
+.log-entry.success .log-msg{color:#b7f5d8}
+.log-entry.error .log-msg{color:#ffc4d0}
+.log-entry.warning .log-msg{color:#ffe5a3}
+
+/* ============ ACCOUNTS LIVE ============ */
+.acc-card{
+  background:linear-gradient(145deg,var(--bg-2),var(--bg-3));
+  border:1px solid var(--border);
+  border-radius:14px;
+  padding:14px 16px;
+  margin-bottom:10px;
+  display:grid;
+  grid-template-columns:1fr auto;
+  gap:12px;align-items:center;
+  transition:all .2s;
+  animation:slideIn .3s ease-out;
+}
+
+.acc-card:hover{
+  border-color:var(--accent);
+  transform:translateX(3px);
+  box-shadow:0 8px 24px rgba(255,107,53,.15);
 }
 
-.btn-remove:hover {
-    background: var(--error);
-    color: white;
-    border-color: var(--error);
+.acc-name{
+  font-weight:800;font-size:14px;
+  margin-bottom:5px;
+  display:flex;align-items:center;gap:6px;
 }
 
-/* Buttons */
-.btn {
-    width: 100%;
-    padding: 13px 20px;
-    border: none;
-    border-radius: 10px;
-    font-family: 'Inter', sans-serif;
-    font-size: 13px;
-    font-weight: 700;
-    letter-spacing: 0.5px;
-    cursor: pointer;
-    transition: all 0.2s;
-    display: flex;
-    align-items: center;
-    justify-content: center;
-    gap: 8px;
-    text-transform: uppercase;
+.acc-meta{
+  font-size:10.5px;color:var(--text-2);
+  font-family:'JetBrains Mono',monospace;
+  display:flex;gap:10px;flex-wrap:wrap;
 }
-
-.btn:disabled {
-    opacity: 0.5;
-    cursor: not-allowed;
+
+.acc-meta span{display:flex;align-items:center;gap:3px}
+
+.acc-badge{
+  padding:6px 14px;border-radius:100px;
+  font-size:10px;font-weight:800;
+  letter-spacing:1px;text-transform:uppercase;
 }
 
-.btn-primary {
-    background: var(--gradient);
-    color: white;
-    box-shadow: 0 4px 16px var(--accent-glow);
+.acc-badge.running{
+  background:rgba(16,215,126,.15);
+  color:var(--success);
+  border:1px solid rgba(16,215,126,.35);
+  animation:pulse 2s infinite;
 }
 
-.btn-primary:not(:disabled):hover {
-    transform: translateY(-2px);
-    box-shadow: 0 8px 24px var(--accent-glow);
+.acc-badge.connecting{
+  background:rgba(255,184,0,.15);
+  color:var(--warning);
+  border:1px solid rgba(255,184,0,.35);
 }
 
-.btn-secondary {
-    background: var(--bg-2);
-    color: var(--text-0);
-    border: 1px solid var(--border);
+.acc-badge.idle{
+  background:rgba(94,106,138,.15);
+  color:var(--text-2);
+  border:1px solid rgba(94,106,138,.35);
 }
 
-.btn-secondary:not(:disabled):hover {
-    background: var(--bg-3);
-    border-color: var(--accent);
+/* ============ EMPTY STATE ============ */
+.empty-state{
+  text-align:center;padding:40px 20px;
+  color:var(--text-2);font-size:12px;
 }
+.empty-state .icon{
+  font-size:42px;margin-bottom:12px;
+  opacity:.4;display:block;
+}
+.empty-state .title{
+  font-weight:700;color:var(--text-1);
+  margin-bottom:4px;
+}
 
-.btn-danger {
-    background: linear-gradient(135deg, #ff3b5c, #c9184a);
-    color: white;
-    box-shadow: 0 4px 16px rgba(255, 59, 92, 0.4);
+/* ============ FOOTER ============ */
+.footer{
+  text-align:center;padding:32px 20px;
+  color:var(--text-2);font-size:12px;
+  border-top:1px solid var(--border);
+  margin-top:32px;
+  position:relative;z-index:1;
 }
 
-.btn-danger:not(:disabled):hover {
-    transform: translateY(-2px);
-    box-shadow: 0 8px 24px rgba(255, 59, 92, 0.5);
+.footer .credit{
+  color:var(--accent);font-weight:900;
+  letter-spacing:1.5px;
+  background:var(--gradient);
+  -webkit-background-clip:text;
+  -webkit-text-fill-color:transparent;
+  background-clip:text;
 }
 
-.btn-row {
-    display: flex;
-    gap: 10px;
-    margin-top: 10px;
+/* ============ TOAST ============ */
+.toast{
+  position:fixed;bottom:24px;right:24px;
+  padding:14px 20px;
+  background:var(--bg-2);
+  border:1px solid var(--border);
+  border-radius:12px;
+  font-size:13px;font-weight:700;
+  box-shadow:0 12px 40px rgba(0,0,0,.5);
+  transform:translateY(120px);
+  opacity:0;
+  transition:all .35s cubic-bezier(.34,1.56,.64,1);
+  z-index:1000;max-width:360px;
+  backdrop-filter:blur(20px);
 }
 
-/* Logs */
-.logs-container {
-    background: var(--bg-0);
-    border-radius: 12px;
-    height: 600px;
-    overflow-y: auto;
-    padding: 16px;
-    font-family: 'JetBrains Mono', monospace;
-    font-size: 12.5px;
-    line-height: 1.7;
+.toast.show{transform:translateY(0);opacity:1}
+.toast.success{border-color:var(--success);color:var(--success);background:rgba(16,215,126,.1)}
+.toast.error{border-color:var(--error);color:var(--error);background:rgba(255,59,92,.1)}
+.toast.info{border-color:var(--info);color:var(--info);background:rgba(77,157,255,.1)}
+.toast.warning{border-color:var(--warning);color:var(--warning);background:rgba(255,184,0,.1)}
+
+/* ============ MODAL ============ */
+.modal-overlay{
+  position:fixed;inset:0;
+  background:rgba(7,10,19,.85);
+  backdrop-filter:blur(8px);
+  display:none;
+  align-items:center;justify-content:center;
+  z-index:200;
+  padding:20px;
+  animation:fadeIn .2s;
 }
 
-.logs-container::-webkit-scrollbar { width: 8px; }
-.logs-container::-webkit-scrollbar-track { background: var(--bg-0); }
-.logs-container::-webkit-scrollbar-thumb { background: var(--border); border-radius: 4px; }
-.logs-container::-webkit-scrollbar-thumb:hover { background: var(--accent); }
+.modal-overlay.show{display:flex}
 
-.log-entry {
-    display: flex;
-    gap: 10px;
-    padding: 3px 0;
-    border-bottom: 1px solid rgba(35, 44, 68, 0.4);
-    animation: slideIn 0.2s ease-out;
-}
-
-@keyframes slideIn {
-    from { opacity: 0; transform: translateX(-6px); }
-    to { opacity: 1; transform: translateX(0); }
+@keyframes fadeIn{from{opacity:0}to{opacity:1}}
+
+.modal{
+  background:var(--bg-1);
+  border:1px solid var(--border);
+  border-radius:18px;
+  padding:28px;
+  max-width:420px;
+  width:100%;
+  box-shadow:0 24px 64px rgba(0,0,0,.6);
+  animation:scaleIn .3s cubic-bezier(.34,1.56,.64,1);
 }
+
+@keyframes scaleIn{from{transform:scale(.9);opacity:0}to{transform:scale(1);opacity:1}}
 
-.log-time { color: var(--text-2); flex-shrink: 0; }
-.log-level { font-weight: 700; flex-shrink: 0; width: 78px; text-transform: uppercase; font-size: 11px; }
-.log-msg { color: var(--text-0); word-break: break-word; }
+.modal h3{
+  font-size:18px;font-weight:800;
+  margin-bottom:8px;text-align:center;
+}
 
-.log-entry.info .log-level { color: var(--info); }
-.log-entry.success .log-level { color: var(--success); }
-.log-entry.warning .log-level { color: var(--warning); }
-.log-entry.error .log-level { color: var(--error); }
+.modal p{
+  color:var(--text-1);font-size:13px;
+  text-align:center;margin-bottom:22px;
+  line-height:1.6;
+}
 
-.log-entry.success .log-msg { color: #b7f5d8; }
-.log-entry.error .log-msg { color: #ffc4d0; }
-.log-entry.warning .log-msg { color: #ffe5a3; }
+.modal-icon{
+  font-size:48px;text-align:center;
+  display:block;margin-bottom:14px;
+}
 
-/* Accounts live */
-.acc-card {
-    background: var(--bg-2);
-    border: 1px solid var(--border);
-    border-radius: 12px;
-    padding: 14px 16px;
-    margin-bottom: 10px;
-    display: grid;
-    grid-template-columns: 1fr auto;
-    gap: 10px;
-    align-items: center;
-    transition: border-color 0.2s;
-}
-
-.acc-card:hover { border-color: var(--accent); }
-
-.acc-name { font-weight: 700; font-size: 13px; margin-bottom: 4px; }
-.acc-meta { font-size: 11px; color: var(--text-2); font-family: 'JetBrains Mono', monospace; }
-
-.acc-badge {
-    padding: 5px 12px;
-    border-radius: 100px;
-    font-size: 10px;
-    font-weight: 700;
-    letter-spacing: 0.8px;
-    text-transform: uppercase;
-}
+.modal-actions{
+  display:flex;gap:10px;
+}
 
-.acc-badge.running { background: rgba(16, 215, 126, 0.15); color: var(--success); border: 1px solid rgba(16, 215, 126, 0.3); }
-.acc-badge.connecting { background: rgba(255, 184, 0, 0.15); color: var(--warning); border: 1px solid rgba(255, 184, 0, 0.3); }
-.acc-badge.idle { background: rgba(94, 104, 133, 0.15); color: var(--text-2); border: 1px solid rgba(94, 104, 133, 0.3); }
-
-.empty-state {
-    text-align: center;
-    padding: 40px 20px;
-    color: var(--text-2);
-    font-size: 13px;
-}
-
-.empty-state .icon {
-    font-size: 40px;
-    margin-bottom: 12px;
-    opacity: 0.5;
-}
-
-/* Footer */
-.footer {
-    text-align: center;
-    padding: 30px 20px;
-    color: var(--text-2);
-    font-size: 12px;
-    border-top: 1px solid var(--border);
-    margin-top: 30px;
-}
-
-.footer .credit {
-    color: var(--accent);
-    font-weight: 700;
-    letter-spacing: 1px;
-}
-
-/* Tabs */
-.tabs {
-    display: flex;
-    gap: 4px;
-    padding: 4px;
-    background: var(--bg-2);
-    border-radius: 10px;
-    margin-bottom: 18px;
-}
-
-.tab {
-    flex: 1;
-    padding: 9px 14px;
-    border-radius: 8px;
-    font-size: 12px;
-    font-weight: 700;
-    letter-spacing: 0.5px;
-    text-align: center;
-    cursor: pointer;
-    color: var(--text-1);
-    transition: all 0.2s;
-    text-transform: uppercase;
-}
-
-.tab.active {
-    background: var(--gradient);
-    color: white;
-    box-shadow: 0 4px 12px var(--accent-glow);
-}
-
-.tab:not(.active):hover {
-    color: var(--text-0);
-    background: var(--bg-3);
-}
-
-.tab-content { display: none; }
-.tab-content.active { display: block; }
-
-/* Notifications */
-.toast {
-    position: fixed;
-    bottom: 24px;
-    right: 24px;
-    padding: 14px 20px;
-    background: var(--bg-2);
-    border: 1px solid var(--border);
-    border-radius: 10px;
-    font-size: 13px;
-    font-weight: 600;
-    box-shadow: 0 8px 32px rgba(0,0,0,0.4);
-    transform: translateY(100px);
-    opacity: 0;
-    transition: all 0.3s;
-    z-index: 1000;
-    max-width: 360px;
-}
-
-.toast.show {
-    transform: translateY(0);
-    opacity: 1;
-}
-
-.toast.success { border-color: var(--success); color: var(--success); }
-.toast.error { border-color: var(--error); color: var(--error); }
-.toast.info { border-color: var(--info); color: var(--info); }
-
-/* Responsive */
-@media (max-width: 640px) {
-    .header { padding: 14px 16px; }
-    .container { padding: 18px 14px 40px; }
-    .stat-value { font-size: 26px; }
-    .brand-text h1 { font-size: 16px; }
-    .btn { font-size: 12px; padding: 12px 16px; }
+/* ============ MOBILE ============ */
+@media(max-width:640px){
+  .header{padding:12px 14px}
+  .container{padding:14px}
+  .stat-value{font-size:22px}
+  .brand-text h1{font-size:15px}
+  .brand-text p{font-size:9px}
+  .logo{width:42px;height:42px;font-size:20px}
+  .btn{font-size:11px;padding:12px 14px}
+  .panel-body{padding:16px}
+  .logs-container{height:440px;font-size:11px}
+  .stat-card{padding:14px}
+  .toast{right:14px;left:14px;bottom:14px;max-width:none}
+  .acc-meta{font-size:10px;gap:6px}
+  .status-pill{padding:6px 12px;font-size:11px}
 }
+
+/* Scrollbar global */
+::-webkit-scrollbar{width:8px;height:8px}
+::-webkit-scrollbar-track{background:var(--bg-0)}
+::-webkit-scrollbar-thumb{background:var(--border);border-radius:4px}
+::-webkit-scrollbar-thumb:hover{background:var(--accent)}
 </style>
 </head>
 <body>
 
 <div class="header">
-    <div class="brand">
-        <div class="logo">🔥</div>
-        <div class="brand-text">
-            <h1>FF Level Up Bot</h1>
-            <p>Premium Dashboard • by NIROB</p>
-        </div>
+  <div class="brand">
+    <div class="logo">🔥</div>
+    <div class="brand-text">
+      <h1>FF Level Up Bot</h1>
+      <p>Ultimate Edition • by NIROB</p>
     </div>
-    <div class="header-actions">
-        <div class="status-pill">
-            <span class="status-dot idle" id="statusDot"></span>
-            <span id="statusText">Idle</span>
-        </div>
+  </div>
+  <div class="header-actions">
+    <div class="status-pill" id="statusPill">
+      <span class="status-dot idle" id="statusDot"></span>
+      <span id="statusText">Idle</span>
     </div>
+  </div>
 </div>
 
 <div class="container">
-    <!-- Stats -->
-    <div class="stats-grid">
-        <div class="stat-card">
-            <div class="stat-label">⚡ Bot Status</div>
-            <div class="stat-value accent" id="statStatus">IDLE</div>
-            <div class="stat-sub" id="statUptime">Not started</div>
+  <div class="stats-grid">
+    <div class="stat-card">
+      <div class="stat-icon">⚡</div>
+      <div class="stat-label">Bot Status</div>
+      <div class="stat-value accent" id="statStatus">IDLE</div>
+      <div class="stat-sub" id="statUptime">Not started</div>
+    </div>
+    <div class="stat-card blue">
+      <div class="stat-icon">👥</div>
+      <div class="stat-label">Accounts</div>
+      <div class="stat-value blue" id="statAccounts">0</div>
+      <div class="stat-sub">Connected workers</div>
+    </div>
+    <div class="stat-card green">
+      <div class="stat-icon">🎯</div>
+      <div class="stat-label">Total Matches</div>
+      <div class="stat-value green" id="statMatches">0</div>
+      <div class="stat-sub">Completed runs</div>
+    </div>
+    <div class="stat-card">
+      <div class="stat-icon">🔥</div>
+      <div class="stat-label">Active Matches</div>
+      <div class="stat-value accent" id="statActive">0</div>
+      <div class="stat-sub">In progress</div>
+    </div>
+  </div>
+
+  <div class="main-grid">
+    <!-- CONTROL PANEL -->
+    <div class="panel">
+      <div class="panel-header">
+        <div class="panel-title"><span class="icon">⚙️</span> Control Panel</div>
+      </div>
+      <div class="panel-body">
+        <div class="form-group">
+          <label class="form-label">UID</label>
+          <input type="text" class="form-input" id="uidInput" placeholder="Enter Free Fire UID" autocomplete="off">
         </div>
-        <div class="stat-card">
-            <div class="stat-label">👥 Accounts</div>
-            <div class="stat-value" id="statAccounts">0</div>
-            <div class="stat-sub">Connected workers</div>
+        <div class="form-group">
+          <label class="form-label">Password</label>
+          <input type="text" class="form-input" id="passInput" placeholder="Enter password" autocomplete="off">
         </div>
-        <div class="stat-card">
-            <div class="stat-label">🎯 Total Matches</div>
-            <div class="stat-value" id="statMatches">0</div>
-            <div class="stat-sub">Completed runs</div>
+        <button class="btn btn-secondary" id="addBtn">➕ Add Account</button>
+
+        <div class="form-label" style="margin-top:16px;margin-bottom:8px;">
+          Queue (<span id="queueCount">0</span>)
         </div>
-        <div class="stat-card">
-            <div class="stat-label">🔥 Active Matches</div>
-            <div class="stat-value accent" id="statActive">0</div>
-            <div class="stat-sub">In progress</div>
+        <div class="accounts-list" id="accountsList">
+          <div class="empty-state">
+            <span class="icon">📋</span>
+            <div class="title">No accounts added</div>
+            <div>Add UID and password above</div>
+          </div>
         </div>
+
+        <div class="btn-row" style="margin-top:14px">
+          <button class="btn btn-primary" id="startBtn">🚀 Start Bot</button>
+        </div>
+        <div class="btn-row">
+          <button class="btn btn-danger" id="stopBtn" disabled>🛑 Stop Bot</button>
+        </div>
+        <div class="btn-row">
+          <button class="btn btn-secondary" id="testBtn">🔍 Test Connection</button>
+        </div>
+      </div>
     </div>
 
-    <!-- Main -->
-    <div class="main-grid">
-        <!-- Left: Control Panel -->
-        <div class="panel">
-            <div class="panel-header">
-                <div class="panel-title"><span class="icon">⚙️</span> Control Panel</div>
-            </div>
-            <div class="panel-body">
-                <div class="form-group">
-                    <label class="form-label">UID</label>
-                    <input type="text" class="form-input" id="uidInput" placeholder="Enter Free Fire UID" autocomplete="off">
-                </div>
-                <div class="form-group">
-                    <label class="form-label">Password</label>
-                    <input type="text" class="form-input" id="passInput" placeholder="Enter password" autocomplete="off">
-                </div>
-                <button class="btn btn-secondary" id="addBtn" style="margin-bottom: 16px;">➕ Add Account</button>
-
-                <div class="form-label" style="margin-bottom: 8px;">Account Queue (<span id="queueCount">0</span>)</div>
-                <div class="accounts-list" id="accountsList">
-                    <div class="empty-state">
-                        <div class="icon">📋</div>
-                        <div>No accounts added yet</div>
-                    </div>
-                </div>
-
-                <div class="btn-row">
-                    <button class="btn btn-primary" id="startBtn">🚀 Start Bot</button>
-                </div>
-                <div class="btn-row">
-                    <button class="btn btn-danger" id="stopBtn" disabled>🛑 Stop Bot</button>
-                </div>
-            </div>
+    <!-- LIVE MONITOR -->
+    <div class="panel">
+      <div class="panel-header">
+        <div class="panel-title"><span class="icon">📡</span> Live Monitor</div>
+        <button class="btn btn-secondary" id="clearLogs" style="width:auto;padding:6px 12px;font-size:10px">🗑 Clear</button>
+      </div>
+      <div class="panel-body">
+        <div class="tabs">
+          <div class="tab active" data-tab="logs">Logs <span class="badge" id="logBadge">0</span></div>
+          <div class="tab" data-tab="accounts">Accounts <span class="badge" id="accBadge">0</span></div>
         </div>
 
-        <!-- Right: Logs + Live -->
-        <div class="panel">
-            <div class="panel-header">
-                <div class="panel-title"><span class="icon">📡</span> Live Monitor</div>
-                <button class="btn btn-secondary" id="clearLogs" style="width: auto; padding: 6px 14px; font-size: 11px;">Clear</button>
+        <div class="tab-content active" id="tab-logs">
+          <div class="logs-container" id="logsContainer">
+            <div class="empty-state">
+              <span class="icon">📜</span>
+              <div class="title">Waiting for logs</div>
+              <div>Start the bot to see activity</div>
             </div>
-            <div class="panel-body">
-                <div class="tabs">
-                    <div class="tab active" data-tab="logs">Logs</div>
-                    <div class="tab" data-tab="accounts">Accounts</div>
-                </div>
-
-                <div class="tab-content active" id="tab-logs">
-                    <div class="logs-container" id="logsContainer">
-                        <div class="empty-state">
-                            <div class="icon">📜</div>
-                            <div>Waiting for logs...</div>
-                        </div>
-                    </div>
-                </div>
-
-                <div class="tab-content" id="tab-accounts">
-                    <div id="accountsLive">
-                        <div class="empty-state">
-                            <div class="icon">👤</div>
-                            <div>No active accounts</div>
-                        </div>
-                    </div>
-                </div>
-            </div>
+          </div>
         </div>
-    </div>
 
-    <div class="footer">
-        Crafted with <span style="color: var(--error);">♥</span> by <span class="credit">NIROB</span> • © 2024 All Rights Reserved
+        <div class="tab-content" id="tab-accounts">
+          <div id="accountsLive">
+            <div class="empty-state">
+              <span class="icon">👤</span>
+              <div class="title">No active accounts</div>
+              <div>Login in progress...</div>
+            </div>
+          </div>
+        </div>
+      </div>
     </div>
+  </div>
+
+  <div class="footer">
+    Crafted with <span style="color:var(--error)">♥</span> by <span class="credit">NIROB</span> • © 2024 All Rights Reserved
+  </div>
+</div>
+
+<!-- Confirm Modal -->
+<div class="modal-overlay" id="confirmModal">
+  <div class="modal">
+    <span class="modal-icon" id="modalIcon">⚠️</span>
+    <h3 id="modalTitle">Confirm Action</h3>
+    <p id="modalText">Are you sure?</p>
+    <div class="modal-actions">
+      <button class="btn btn-secondary" id="modalCancel">Cancel</button>
+      <button class="btn btn-danger" id="modalConfirm">Confirm</button>
+    </div>
+  </div>
 </div>
 
 <div class="toast" id="toast"></div>
 
 <script>
-(function() {
-    'use strict';
+(function(){
+  'use strict';
 
-    // State
-    const state = {
-        accounts: [],
-        logs: [],
-        stats: {
-            bot_status: "idle",
-            active_matches: 0,
-            total_matches: 0,
-            uptime_start: 0,
-            accounts: {}
-        },
-        ws: null,
-        wsReconnectTimer: null
+  const state = {
+    accounts: [],
+    logs: [],
+    stats: {bot_status:'idle',active_matches:0,total_matches:0,uptime_start:0,accounts:{}},
+    ws: null,
+    wsTimer: null,
+    logCount: 0
+  };
+
+  const $ = id => document.getElementById(id);
+
+  // ============ TOAST ============
+  let toastTimer = null;
+  function toast(msg, type='info'){
+    const el = $('toast');
+    el.textContent = msg;
+    el.className = `toast show ${type}`;
+    clearTimeout(toastTimer);
+    toastTimer = setTimeout(()=>{ el.className = 'toast'; }, 3400);
+  }
+
+  // ============ CONFIRM MODAL ============
+  function confirmAction(icon, title, text, onConfirm){
+    $('modalIcon').textContent = icon;
+    $('modalTitle').textContent = title;
+    $('modalText').textContent = text;
+    $('confirmModal').classList.add('show');
+    const cleanup = () => {
+      $('confirmModal').classList.remove('show');
+      $('modalConfirm').onclick = null;
+      $('modalCancel').onclick = null;
+    };
+    $('modalCancel').onclick = cleanup;
+    $('modalConfirm').onclick = () => { cleanup(); onConfirm(); };
+  }
+
+  // ============ WEBSOCKET ============
+  function connectWS(){
+    if(state.ws && state.ws.readyState === WebSocket.OPEN) return;
+    const proto = location.protocol === 'https:' ? 'wss:' : 'ws:';
+    const url = `${proto}//${location.host}/ws`;
+    try { state.ws = new WebSocket(url); }
+    catch(e){ scheduleReconnect(); return; }
+
+    state.ws.onopen = () => {
+      console.log('[WS] connected');
+      clearTimeout(state.wsTimer);
     };
 
-    // DOM refs
-    const $ = (id) => document.getElementById(id);
+    state.ws.onmessage = ev => {
+      try { handleMessage(JSON.parse(ev.data)); } catch(e){}
+    };
 
-    // Toast
-    let toastTimer = null;
-    function toast(msg, type = 'info') {
-        const el = $('toast');
-        el.textContent = msg;
-        el.className = `toast show ${type}`;
-        clearTimeout(toastTimer);
-        toastTimer = setTimeout(() => {
-            el.className = 'toast';
-        }, 3200);
+    state.ws.onclose = () => {
+      console.log('[WS] closed, reconnecting...');
+      scheduleReconnect();
+    };
+
+    state.ws.onerror = () => {
+      try { state.ws.close(); } catch(e){}
+    };
+  }
+
+  function scheduleReconnect(){
+    clearTimeout(state.wsTimer);
+    state.wsTimer = setTimeout(connectWS, 2000);
+  }
+
+  function handleMessage(msg){
+    if(msg.type === 'log'){
+      addLog(msg.data);
+    } else if(msg.type === 'history'){
+      (msg.data || []).forEach(addLog);
+      if(msg.stats){ state.stats = msg.stats; renderStats(); }
+    } else if(msg.type === 'stats'){
+      state.stats = msg.data;
+      renderStats();
+    }
+  }
+
+  // ============ LOGS ============
+  function addLog(entry){
+    state.logCount++;
+    state.logs.push(entry);
+    if(state.logs.length > 800) state.logs.shift();
+    $('logBadge').textContent = state.logCount;
+
+    const cont = $('logsContainer');
+    const emptyState = cont.querySelector('.empty-state');
+    if(emptyState) cont.innerHTML = '';
+
+    const div = document.createElement('div');
+    div.className = `log-entry ${entry.level || 'info'}`;
+    div.innerHTML = `
+      <span class="log-time">${entry.time || ''}</span>
+      <span class="log-level">${(entry.level || 'info').toUpperCase()}</span>
+      <span class="log-msg">${escapeHtml(entry.message || '')}</span>
+    `;
+    cont.appendChild(div);
+
+    // Auto-scroll if near bottom
+    if(cont.scrollHeight - cont.scrollTop - cont.clientHeight < 150){
+      cont.scrollTop = cont.scrollHeight;
     }
 
-    // WebSocket
-    function connectWS() {
-        if (state.ws && state.ws.readyState === WebSocket.OPEN) return;
-        const proto = location.protocol === 'https:' ? 'wss:' : 'ws:';
-        const url = `${proto}//${location.host}/ws`;
-        try {
-            state.ws = new WebSocket(url);
-        } catch(e) {
-            scheduleReconnect();
-            return;
-        }
+    while(cont.children.length > 800) cont.removeChild(cont.firstChild);
+  }
 
-        state.ws.onopen = () => {
-            console.log('[WS] Connected');
-            clearInterval(state.wsReconnectTimer);
-        };
+  function escapeHtml(s){
+    return String(s)
+      .replace(/&/g,'&amp;')
+      .replace(/</g,'&lt;')
+      .replace(/>/g,'&gt;')
+      .replace(/"/g,'&quot;')
+      .replace(/'/g,'&#39;');
+  }
 
-        state.ws.onmessage = (ev) => {
-            try {
-                const msg = JSON.parse(ev.data);
-                handleMessage(msg);
-            } catch(e) {}
-        };
+  // ============ RENDER STATS ============
+  function renderStats(){
+    const s = state.stats;
+    const botStatus = (s.bot_status || 'idle').toLowerCase();
 
-        state.ws.onclose = () => {
-            console.log('[WS] Disconnected');
-            scheduleReconnect();
-        };
+    $('statStatus').textContent = botStatus.toUpperCase();
+    $('statusText').textContent = botStatus.charAt(0).toUpperCase() + botStatus.slice(1);
 
-        state.ws.onerror = () => {
-            try { state.ws.close(); } catch(e){}
-        };
+    const dot = $('statusDot');
+    const pill = $('statusPill');
+    dot.className = 'status-dot ' + (botStatus === 'running' ? 'running' : (botStatus === 'stopped' ? 'stopped' : 'idle'));
+    pill.className = 'status-pill ' + (botStatus === 'running' ? 'running' : (botStatus === 'stopped' ? 'stopped' : ''));
+
+    const accCount = Object.keys(s.accounts || {}).length;
+    $('statAccounts').textContent = accCount;
+    $('statMatches').textContent = s.total_matches || 0;
+    $('statActive').textContent = s.active_matches || 0;
+    $('accBadge').textContent = accCount;
+
+    if(s.uptime_start && botStatus === 'running'){
+      updateUptime();
+    } else {
+      $('statUptime').textContent = 'Not started';
     }
 
-    function scheduleReconnect() {
-        clearTimeout(state.wsReconnectTimer);
-        state.wsReconnectTimer = setTimeout(connectWS, 2000);
+    const isRunning = botStatus === 'running';
+    $('startBtn').disabled = isRunning;
+    $('stopBtn').disabled = !isRunning;
+
+    renderLiveAccounts(s.accounts || {});
+  }
+
+  function updateUptime(){
+    if(state.stats.bot_status !== 'running' || !state.stats.uptime_start) return;
+    const up = Math.floor((Date.now()/1000) - state.stats.uptime_start);
+    const h = Math.floor(up/3600);
+    const m = Math.floor((up%3600)/60);
+    const sec = up%60;
+    $('statUptime').textContent = `⏱ ${h}h ${m}m ${sec}s`;
+  }
+
+  setInterval(updateUptime, 1000);
+
+  function renderLiveAccounts(accounts){
+    const cont = $('accountsLive');
+    const keys = Object.keys(accounts);
+    if(keys.length === 0){
+      cont.innerHTML = `<div class="empty-state">
+        <span class="icon">👤</span>
+        <div class="title">No active accounts</div>
+        <div>Login in progress...</div>
+      </div>`;
+      return;
     }
-
-    function handleMessage(msg) {
-        if (msg.type === 'log') {
-            addLog(msg.data);
-        } else if (msg.type === 'history') {
-            (msg.data || []).forEach(addLog);
-            if (msg.stats) {
-                state.stats = msg.stats;
-                renderStats();
-            }
-        } else if (msg.type === 'stats') {
-            state.stats = msg.data;
-            renderStats();
-        }
-    }
-
-    function addLog(entry) {
-        state.logs.push(entry);
-        if (state.logs.length > 500) state.logs.shift();
-        const cont = $('logsContainer');
-        // Clear empty state
-        if (cont.querySelector('.empty-state')) cont.innerHTML = '';
-        const div = document.createElement('div');
-        div.className = `log-entry ${entry.level || 'info'}`;
-        div.innerHTML = `
-            <span class="log-time">${entry.time || ''}</span>
-            <span class="log-level">${(entry.level || 'info').toUpperCase()}</span>
-            <span class="log-msg">${escapeHtml(entry.message || '')}</span>
-        `;
-        cont.appendChild(div);
-        // Auto-scroll
-        cont.scrollTop = cont.scrollHeight;
-        // Trim DOM
-        while (cont.children.length > 500) cont.removeChild(cont.firstChild);
-    }
-
-    function escapeHtml(s) {
-        return String(s)
-            .replace(/&/g, '&amp;')
-            .replace(/</g, '&lt;')
-            .replace(/>/g, '&gt;')
-            .replace(/"/g, '&quot;')
-            .replace(/'/g, '&#39;');
-    }
-
-    // Stats rendering
-    function renderStats() {
-        const s = state.stats;
-        const botStatus = (s.bot_status || 'idle').toLowerCase();
-        $('statStatus').textContent = botStatus.toUpperCase();
-        $('statusText').textContent = botStatus.charAt(0).toUpperCase() + botStatus.slice(1);
-        const dot = $('statusDot');
-        dot.className = 'status-dot ' + (botStatus === 'running' ? 'running' : (botStatus === 'stopped' ? 'stopped' : 'idle'));
-
-        const accCount = Object.keys(s.accounts || {}).length;
-        $('statAccounts').textContent = accCount;
-        $('statMatches').textContent = s.total_matches || 0;
-        $('statActive').textContent = s.active_matches || 0;
-
-        // Uptime
-        if (s.uptime_start && botStatus === 'running') {
-            const up = Math.floor((Date.now()/1000) - s.uptime_start);
-            const h = Math.floor(up/3600);
-            const m = Math.floor((up%3600)/60);
-            const sec = up%60;
-            $('statUptime').textContent = `Uptime: ${h}h ${m}m ${sec}s`;
-        } else {
-            $('statUptime').textContent = 'Not started';
-        }
-
-        // Buttons
-        const isRunning = botStatus === 'running';
-        $('startBtn').disabled = isRunning;
-        $('stopBtn').disabled = !isRunning;
-
-        // Live accounts
-        renderLiveAccounts(s.accounts || {});
-    }
-
-    function renderLiveAccounts(accounts) {
-        const cont = $('accountsLive');
-        const keys = Object.keys(accounts);
-        if (keys.length === 0) {
-            cont.innerHTML = '<div class="empty-state"><div class="icon">👤</div><div>No active accounts</div></div>';
-            return;
-        }
-        cont.innerHTML = keys.map(uid => {
-            const a = accounts[uid];
-            const status = (a.status || 'connecting').toLowerCase();
-            return `
-                <div class="acc-card">
-                    <div>
-                        <div class="acc-name">${escapeHtml(a.nickname || uid)}</div>
-                        <div class="acc-meta">UID: ${escapeHtml(uid)} • Lvl ${a.level || 1} • EXP ${a.exp || 0} • ${a.region || 'ME'}</div>
-                    </div>
-                    <div class="acc-badge ${status}">${status}</div>
-                </div>
-            `;
-        }).join('');
-    }
-
-    // Uptime ticker
-    setInterval(() => {
-        if (state.stats.bot_status === 'running' && state.stats.uptime_start) {
-            const up = Math.floor((Date.now()/1000) - state.stats.uptime_start);
-            const h = Math.floor(up/3600);
-            const m = Math.floor((up%3600)/60);
-            const sec = up%60;
-            $('statUptime').textContent = `Uptime: ${h}h ${m}m ${sec}s`;
-        }
-    }, 1000);
-
-    // Account queue
-    function renderQueue() {
-        const cont = $('accountsList');
-        $('queueCount').textContent = state.accounts.length;
-        if (state.accounts.length === 0) {
-            cont.innerHTML = '<div class="empty-state"><div class="icon">📋</div><div>No accounts added yet</div></div>';
-            return;
-        }
-        cont.innerHTML = state.accounts.map((a, i) => `
-            <div class="account-item">
-                <div class="account-info">
-                    <div class="account-uid">${escapeHtml(a.uid)}</div>
-                    <div class="account-pass">${escapeHtml('•'.repeat(Math.min(a.password.length, 16)))}</div>
-                </div>
-                <button class="btn-remove" data-idx="${i}" title="Remove">✕</button>
+    cont.innerHTML = keys.map(uid => {
+      const a = accounts[uid];
+      const status = (a.status || 'connecting').toLowerCase();
+      const initial = (a.nickname || uid).charAt(0).toUpperCase();
+      return `
+        <div class="acc-card">
+          <div style="display:flex;align-items:center;gap:12px;min-width:0">
+            <div class="account-avatar">${escapeHtml(initial)}</div>
+            <div style="min-width:0">
+              <div class="acc-name">${escapeHtml(a.nickname || uid)}</div>
+              <div class="acc-meta">
+                <span>🆔 ${escapeHtml(uid)}</span>
+                <span>⭐ Lvl ${a.level || 1}</span>
+                <span>💎 ${a.exp || 0}</span>
+                <span>🌍 ${a.region || 'ME'}</span>
+                ${a.matches ? `<span>🎯 ${a.matches}</span>` : ''}
+              </div>
             </div>
-        `).join('');
-        cont.querySelectorAll('.btn-remove').forEach(btn => {
-            btn.addEventListener('click', () => {
-                state.accounts.splice(parseInt(btn.dataset.idx), 1);
-                renderQueue();
-            });
-        });
+          </div>
+          <div class="acc-badge ${status}">${status}</div>
+        </div>
+      `;
+    }).join('');
+  }
+
+  // ============ QUEUE ============
+  function renderQueue(){
+    const cont = $('accountsList');
+    $('queueCount').textContent = state.accounts.length;
+    if(state.accounts.length === 0){
+      cont.innerHTML = `<div class="empty-state">
+        <span class="icon">📋</span>
+        <div class="title">No accounts added</div>
+        <div>Add UID and password above</div>
+      </div>`;
+      return;
     }
-
-    // Add account
-    $('addBtn').addEventListener('click', () => {
-        const uid = $('uidInput').value.trim();
-        const password = $('passInput').value.trim();
-        if (!uid || !password) {
-            toast('UID and Password are required', 'error');
-            return;
-        }
-        if (state.accounts.some(a => a.uid === uid)) {
-            toast('UID already in queue', 'warning');
-            return;
-        }
-        state.accounts.push({ uid, password });
-        $('uidInput').value = '';
-        $('passInput').value = '';
-        $('uidInput').focus();
+    cont.innerHTML = state.accounts.map((a, i) => {
+      const initial = (a.uid || '?').charAt(0).toUpperCase();
+      return `
+        <div class="account-item">
+          <div class="account-avatar">${escapeHtml(initial)}</div>
+          <div class="account-info">
+            <div class="account-uid">${escapeHtml(a.uid)}</div>
+            <div class="account-pass">${escapeHtml('•'.repeat(Math.min(a.password.length, 20)))}</div>
+          </div>
+          <button class="btn-remove" data-idx="${i}" title="Remove">✕</button>
+        </div>
+      `;
+    }).join('');
+    cont.querySelectorAll('.btn-remove').forEach(btn => {
+      btn.addEventListener('click', () => {
+        const idx = parseInt(btn.dataset.idx);
+        const removed = state.accounts.splice(idx, 1)[0];
         renderQueue();
-        toast('Account added to queue', 'success');
+        toast(`Removed ${removed.uid}`, 'info');
+      });
     });
+  }
 
-    // Enter key to add
-    $('passInput').addEventListener('keydown', (e) => {
-        if (e.key === 'Enter') $('addBtn').click();
-    });
-    $('uidInput').addEventListener('keydown', (e) => {
-        if (e.key === 'Enter') $('passInput').focus();
-    });
+  // ============ EVENT: ADD ============
+  $('addBtn').addEventListener('click', () => {
+    const uid = $('uidInput').value.trim();
+    const password = $('passInput').value.trim();
+    if(!uid || !password){
+      toast('UID and Password required', 'error');
+      return;
+    }
+    if(!/^\d{6,12}$/.test(uid)){
+      toast('UID must be 6-12 digits', 'warning');
+      return;
+    }
+    if(state.accounts.some(a => a.uid === uid)){
+      toast('UID already in queue', 'warning');
+      return;
+    }
+    state.accounts.push({uid, password});
+    $('uidInput').value = '';
+    $('passInput').value = '';
+    $('uidInput').focus();
+    renderQueue();
+    toast(`✓ Added ${uid}`, 'success');
+  });
 
-    // Start bot
-    $('startBtn').addEventListener('click', async () => {
-        if (state.accounts.length === 0) {
-            toast('Add at least one account', 'error');
-            return;
-        }
+  $('passInput').addEventListener('keydown', e => {
+    if(e.key === 'Enter') $('addBtn').click();
+  });
+  $('uidInput').addEventListener('keydown', e => {
+    if(e.key === 'Enter') $('passInput').focus();
+  });
+
+  // ============ EVENT: START ============
+  $('startBtn').addEventListener('click', () => {
+    if(state.accounts.length === 0){
+      toast('Add at least one account', 'error');
+      return;
+    }
+    confirmAction('🚀', 'Start Bot?',
+      `Launch bot with ${state.accounts.length} account(s)?`,
+      async () => {
         $('startBtn').disabled = true;
         try {
-            const res = await fetch('/api/start', {
-                method: 'POST',
-                headers: { 'Content-Type': 'application/json' },
-                body: JSON.stringify({ accounts: state.accounts })
-            });
-            const data = await res.json();
-            if (data.ok) {
-                toast(data.message || 'Bot started', 'success');
-            } else {
-                toast(data.message || 'Failed to start', 'error');
-                $('startBtn').disabled = false;
-            }
-        } catch(e) {
-            toast('Network error: ' + e.message, 'error');
-            $('startBtn').disabled = false;
+          const res = await fetch('/api/start', {
+            method:'POST',
+            headers:{'Content-Type':'application/json'},
+            body: JSON.stringify({accounts: state.accounts})
+          });
+          const data = await res.json();
+          toast(data.message || (data.ok ? 'Bot started' : 'Failed'), data.ok ? 'success' : 'error');
+          if(!data.ok) $('startBtn').disabled = false;
+        } catch(e){
+          toast('Network error: ' + e.message, 'error');
+          $('startBtn').disabled = false;
         }
-    });
+      });
+  });
 
-    // Stop bot
-    $('stopBtn').addEventListener('click', async () => {
+  // ============ EVENT: STOP ============
+  $('stopBtn').addEventListener('click', () => {
+    confirmAction('🛑', 'Stop Bot?',
+      'This will stop all running workers.',
+      async () => {
         $('stopBtn').disabled = true;
         try {
-            const res = await fetch('/api/stop', { method: 'POST' });
-            const data = await res.json();
-            toast(data.message || 'Bot stopped', data.ok ? 'info' : 'error');
-            if (!data.ok) $('stopBtn').disabled = false;
-        } catch(e) {
-            toast('Network error: ' + e.message, 'error');
-            $('stopBtn').disabled = false;
+          const res = await fetch('/api/stop', {method:'POST'});
+          const data = await res.json();
+          toast(data.message || (data.ok ? 'Bot stopped' : 'Failed'), data.ok ? 'info' : 'error');
+        } catch(e){
+          toast('Network error: ' + e.message, 'error');
         }
+      });
+  });
+
+  // ============ EVENT: TEST ============
+  $('testBtn').addEventListener('click', async () => {
+    $('testBtn').disabled = true;
+    toast('Testing server...', 'info');
+    try {
+      const res = await fetch('/api/test-connection', {method:'POST'});
+      const data = await res.json();
+      if(data.ok){
+        toast(`✓ Server OK • v${data.version}`, 'success');
+      } else {
+        toast('✗ ' + (data.message || 'Failed'), 'error');
+      }
+    } catch(e){
+      toast('Network error', 'error');
+    } finally {
+      $('testBtn').disabled = false;
+    }
+  });
+
+  // ============ EVENT: CLEAR LOGS ============
+  $('clearLogs').addEventListener('click', () => {
+    state.logs = [];
+    state.logCount = 0;
+    $('logBadge').textContent = '0';
+    $('logsContainer').innerHTML = `<div class="empty-state">
+      <span class="icon">📜</span>
+      <div class="title">Logs cleared</div>
+      <div>New logs will appear here</div>
+    </div>`;
+    toast('Logs cleared', 'info');
+  });
+
+  // ============ TABS ============
+  document.querySelectorAll('.tab').forEach(tab => {
+    tab.addEventListener('click', () => {
+      document.querySelectorAll('.tab').forEach(t => t.classList.remove('active'));
+      document.querySelectorAll('.tab-content').forEach(c => c.classList.remove('active'));
+      tab.classList.add('active');
+      const target = $('tab-' + tab.dataset.tab);
+      if(target) target.classList.add('active');
     });
+  });
 
-    // Clear logs
-    $('clearLogs').addEventListener('click', () => {
-        state.logs = [];
-        const cont = $('logsContainer');
-        cont.innerHTML = '<div class="empty-state"><div class="icon">📜</div><div>Waiting for logs...</div></div>';
-    });
+  // ============ INIT ============
+  fetch('/api/status').then(r => r.json()).then(data => {
+    if(data.stats){ state.stats = data.stats; renderStats(); }
+    if(data.bot && data.bot.accounts && data.bot.accounts.length){
+      state.accounts = data.bot.accounts;
+      renderQueue();
+    }
+  }).catch(() => {});
 
-    // Tabs
-    document.querySelectorAll('.tab').forEach(tab => {
-        tab.addEventListener('click', () => {
-            document.querySelectorAll('.tab').forEach(t => t.classList.remove('active'));
-            document.querySelectorAll('.tab-content').forEach(c => c.classList.remove('active'));
-            tab.classList.add('active');
-            const target = document.getElementById('tab-' + tab.dataset.tab);
-            if (target) target.classList.add('active');
-        });
-    });
-
-    // Initial fetch of status
-    fetch('/api/status').then(r => r.json()).then(data => {
-        if (data.stats) {
-            state.stats = data.stats;
-            renderStats();
-        }
-        if (data.bot && data.bot.accounts && data.bot.accounts.length) {
-            state.accounts = data.bot.accounts;
-            renderQueue();
-        }
-    }).catch(() => {});
-
-    // Connect WS
-    connectWS();
+  connectWS();
+  renderQueue();
 })();
 </script>
 </body>
@@ -3137,15 +3367,16 @@ body {
 # ============================================================
 
 def run_server():
-    print("\n" + "=" * 62)
-    print("   🔥 FF LEVEL UP BOT — WEB DASHBOARD EDITION")
+    print("\n" + "═" * 64)
+    print("   🔥 FF LEVEL UP BOT — ULTIMATE EDITION")
     print("   👑 Created by: NIROB")
-    print("=" * 62)
-    print("   🌐 Dashboard:  http://127.0.0.1:8080")
-    print("   📡 WebSocket:  ws://127.0.0.1:8080/ws")
-    print("=" * 62)
+    print("═" * 64)
+    print(f"   🌐 Dashboard:  http://127.0.0.1:8080")
+    print(f"   📡 WebSocket:  ws://127.0.0.1:8080/ws")
+    print(f"   📚 API Docs:   http://127.0.0.1:8080/docs")
+    print("═" * 64)
     print("   Press CTRL+C to stop the server")
-    print("=" * 62 + "\n")
+    print("═" * 64 + "\n")
     uvicorn.run(
         app,
         host="0.0.0.0",
@@ -3162,5 +3393,4 @@ if __name__ == "__main__":
         print("\n👋 Server stopped. Goodbye!")
     except Exception as e:
         print(f"\n❌ Fatal error: {e}")
-        import traceback
         traceback.print_exc()
